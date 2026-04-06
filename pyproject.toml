@@ -31,6 +31,7 @@ dev = [
 
 [project.scripts]
 dqi = "dqi.cli.main:cli"
+dqi-mcp = "dqi.mcp.server:main"
 
 [build-system]
 requires = ["hatchling"]
