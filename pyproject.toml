@@ -31,6 +31,8 @@ dashboard = [
     "fastapi>=0.115",
     "uvicorn>=0.31,<0.43",
     "jinja2>=3.1",
+    "python-jose[cryptography]>=3.3",
+    "passlib[bcrypt]>=1.7",
 ]
 dev = [
     "pytest>=8.0",
