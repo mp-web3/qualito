@@ -24,6 +24,11 @@ htmlcov/
 # DQI local data
 .dqi/
 
+# Environment files
+.env
+.env.local
+.env.production
+
 # OS
 .DS_Store
 Thumbs.db
