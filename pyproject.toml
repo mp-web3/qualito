@@ -19,14 +19,17 @@ classifiers = [
     "Topic :: Software Development :: Quality Assurance",
 ]
 dependencies = [
-    "click>=8.1",
+    "click>=8.1,<8.3.2",
 ]
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.0"]
+mcp = [
+    "mcp>=1.0,<1.27",
+    "uvicorn>=0.31,<0.43",
+]
 dev = [
     "pytest>=8.0",
-    "ruff>=0.4",
+    "ruff>=0.4,<0.15.9",
 ]
 
 [project.scripts]
