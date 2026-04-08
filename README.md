@@ -1,69 +1,105 @@
-# DQI — Delegation Quality Index
+# Qualito
 
-Measure and improve AI agent delegation quality. CLI tool + MCP server for Claude Code.
+Quality metrics for AI-assisted development. Know if your Claude Code sessions are worth the cost.
 
-## Installation
+[![PyPI](https://img.shields.io/pypi/v/qualito)](https://pypi.org/project/qualito/)
+[![Python](https://img.shields.io/pypi/pyversions/qualito)](https://pypi.org/project/qualito/)
+[![License](https://img.shields.io/github/license/mp-web3/qualito)](LICENSE)
+
+## What it does
+
+Qualito analyzes your Claude Code sessions and gives you a **DQI score** (Delegation Quality Index) — a composite metric that measures how effectively you're using AI assistance. It tracks cost, duration, success rate, and quality across every session.
+
+- Import existing Claude Code sessions — no behavior change needed
+- Score each session with a DQI composite (0-100)
+- Track costs, detect incidents, monitor quality trends
+- Set SLOs and get alerts when quality drops
+- Run experiments to compare different approaches
+
+## Quick Start
 
 ```bash
-pip install dqi
-# or with MCP server support:
-pip install "dqi[mcp]"
+# Install
+pip install qualito
+
+# Initialize in your project
+cd your-project
+qualito init
+
+# Import your Claude Code sessions
+qualito import
+
+# Score them
+qualito score
+
+# See results
+qualito status
 ```
 
-## MCP Server Setup
+Every Claude Code user already has session data at `~/.claude/projects/`. Qualito reads it — you'll see your first scores in under 2 minutes.
 
-Add to your `.claude.json` or `.mcp.json`:
+## Cloud Dashboard
+
+```bash
+# Authenticate with qualito.ai
+qualito login
+
+# Push data to cloud
+qualito sync
+
+# Open dashboard
+# → https://app.qualito.ai
+```
+
+**Free tier:** 100 runs/month, 1 workspace. **Pro ($29/mo):** unlimited.
+
+## CLI Commands
+
+| Command | What it does |
+|---------|-------------|
+| `qualito init` | Initialize Qualito in your project |
+| `qualito import` | Import Claude Code session logs |
+| `qualito score` | Calculate DQI scores for imported runs |
+| `qualito status` | Show current DQI status |
+| `qualito costs` | Cost breakdown and waste analysis |
+| `qualito incidents` | Active quality incidents |
+| `qualito slo` | SLO compliance check |
+| `qualito dashboard` | Launch local web dashboard |
+| `qualito login` | Authenticate with qualito.ai |
+| `qualito sync` | Push local data to cloud |
+| `qualito logout` | Remove cloud credentials |
+
+## MCP Server
+
+Use Qualito inline in your editor via MCP:
 
 ```json
 {
-  "dqi": {
-    "command": "uvx",
-    "args": ["dqi-mcp"]
+  "mcpServers": {
+    "qualito": {
+      "command": "uvx",
+      "args": ["qualito-mcp"]
+    }
   }
 }
 ```
 
-### Available Tools
+7 tools available: `dqi_score`, `dqi_cost`, `dqi_patterns`, `dqi_warnings`, `dqi_templates`, `dqi_incidents`, `dqi_slo`.
 
-| Tool | Description |
-|------|-------------|
-| `dqi_score` | DQI score summary: average, trend, component breakdown, tier distribution |
-| `dqi_cost` | Cost analysis: total spend, average per run, daily trend, waste estimate |
-| `dqi_patterns` | Repeated task pattern detection with classification and recommendations |
-| `dqi_warnings` | Underperforming workspace/task_type combos with actionable suggestions |
-| `dqi_templates` | Task type inference and delegation template recommendations |
-| `dqi_incidents` | Quality incidents: regressions, anomalies, severity tracking |
-| `dqi_slo` | SLO compliance: quality, availability, and cost targets |
-
-## Deployment
-
-The DQI dashboard deploys as a split-stack: **Railway** (API) + **Vercel** (frontend).
-
-### API (Railway)
-
-1. Connect the repo to Railway
-2. Set environment variables:
-   - `DQI_JWT_SECRET` — stable random secret for JWT signing
-   - `DQI_DIR` — data directory path (e.g. `/data/.dqi`)
-   - `CORS_ORIGINS` — comma-separated allowed origins (e.g. `https://dqi.dev,https://www.dqi.dev`)
-3. Railway will auto-detect the `Dockerfile` and `railway.json`
-
-### Frontend (Vercel)
-
-1. Set the root directory to `src/dqi/dashboard/frontend`
-2. Set environment variable:
-   - `VITE_API_URL` — Railway API URL (e.g. `https://api.dqi.dev`)
-3. The `vercel.json` rewrites `/api/*` requests to the Railway backend
-
-### Local Development
+## Local Development
 
 ```bash
-# Copy and fill in env vars
-cp env.example .env
+git clone https://github.com/mp-web3/qualito.git
+cd qualito
+uv sync --extra dev --extra dashboard
 
-# API (from repo root)
-uv run uvicorn dqi.dashboard.app:create_app --factory --port 8090
+# Run tests
+uv run pytest
 
-# Frontend (from src/dqi/dashboard/frontend/)
-npm install && npm run dev
+# Local dashboard
+uv run qualito dashboard
 ```
+
+## License
+
+MIT

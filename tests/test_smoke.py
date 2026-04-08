@@ -5,25 +5,25 @@ from pathlib import Path
 
 
 def test_import_db():
-    from dqi.core import db
+    from qualito.core import db
     assert hasattr(db, "get_db")
     assert hasattr(db, "SCHEMA")
 
 
 def test_import_dqi():
-    from dqi.core import dqi
+    from qualito.core import dqi
     assert hasattr(dqi, "calculate_dqi")
     assert hasattr(dqi, "store_dqi")
 
 
 def test_import_evaluator():
-    from dqi.core import evaluator
+    from qualito.core import evaluator
     assert hasattr(evaluator, "auto_evaluate")
     assert hasattr(evaluator, "human_score")
 
 
 def test_import_stream_parser():
-    from dqi.core import stream_parser
+    from qualito.core import stream_parser
     assert hasattr(stream_parser, "parse_stream")
     assert hasattr(stream_parser, "ParsedStream")
     assert hasattr(stream_parser, "ToolCall")
@@ -31,33 +31,33 @@ def test_import_stream_parser():
 
 
 def test_import_measure():
-    from dqi.core import measure
+    from qualito.core import measure
     assert hasattr(measure, "take_baseline")
     assert hasattr(measure, "evaluate_change")
     assert hasattr(measure, "monitor")
 
 
 def test_import_benchmark():
-    from dqi.core import benchmark
+    from qualito.core import benchmark
     assert hasattr(benchmark, "define_suite")
     assert hasattr(benchmark, "run_experiment")
     assert hasattr(benchmark, "compare_experiments")
 
 
 def test_import_pattern_detector():
-    from dqi.core import pattern_detector
+    from qualito.core import pattern_detector
     assert hasattr(pattern_detector, "detect_patterns")
     assert hasattr(pattern_detector, "normalize_task")
 
 
 def test_import_feedback_loop():
-    from dqi.core import feedback_loop
+    from qualito.core import feedback_loop
     assert hasattr(feedback_loop, "run_feedback_loop")
 
 
 def test_import_core_package():
     """Test that the core __init__.py exports work."""
-    from dqi.core import (
+    from qualito.core import (
         calculate_dqi, store_dqi, auto_evaluate, human_score,
         parse_stream, ParsedStream, ToolCall, FileActivity,
         get_db, get_run, get_metrics, insert_run, update_run,
@@ -72,7 +72,7 @@ def test_import_core_package():
 
 def test_calculate_dqi_mock_run():
     """Test calculate_dqi with a mock run dict."""
-    from dqi.core.dqi import calculate_dqi
+    from qualito.core.dqi import calculate_dqi
 
     mock_run = {
         "status": "completed",
@@ -99,7 +99,7 @@ def test_calculate_dqi_mock_run():
 
 def test_parse_stream_empty():
     """Test parse_stream with a non-existent path returns empty ParsedStream."""
-    from dqi.core.stream_parser import parse_stream, ParsedStream
+    from qualito.core.stream_parser import parse_stream, ParsedStream
 
     result = parse_stream(Path("/nonexistent/path/stream.jsonl"))
     assert isinstance(result, ParsedStream)
@@ -110,7 +110,7 @@ def test_parse_stream_empty():
 
 def test_normalize_task():
     """Test normalize_task strips IDs and lowercases."""
-    from dqi.core.pattern_detector import normalize_task
+    from qualito.core.pattern_detector import normalize_task
 
     assert normalize_task("Review PR #624 on propellerswap-frontend") == "review pr #n on propellerswap-frontend"
     assert normalize_task("Read Jira ticket 1234567890") == "read jira ticket id"
@@ -121,7 +121,7 @@ def test_normalize_task():
 
 def test_get_db_creates_file(tmp_path):
     """Test get_db creates a DB file in the specified directory."""
-    from dqi.core.db import get_db
+    from qualito.core.db import get_db
 
     db_path = tmp_path / "test.db"
     conn = get_db(db_path=db_path)
@@ -144,7 +144,7 @@ def test_get_db_creates_file(tmp_path):
 
 def test_import_incident_detector():
     """Verify incident detector module imports."""
-    from dqi.core import incident_detector
+    from qualito.core import incident_detector
     assert hasattr(incident_detector, "check_run")
     assert hasattr(incident_detector, "check_auto_resolve")
     assert hasattr(incident_detector, "check_monitoring_close")
@@ -157,7 +157,7 @@ def test_import_incident_detector():
 
 def test_incidents_table_exists(tmp_path):
     """Verify incidents and incident_events tables are in the schema."""
-    from dqi.core.db import get_db
+    from qualito.core.db import get_db
 
     db_path = tmp_path / "test.db"
     conn = get_db(db_path=db_path)
@@ -182,8 +182,8 @@ def test_incidents_table_exists(tmp_path):
 
 def test_check_run_with_no_data(tmp_path):
     """Call check_run with empty DB — should return empty list, not crash."""
-    from dqi.core.db import get_db
-    from dqi.core.incident_detector import check_run
+    from qualito.core.db import get_db
+    from qualito.core.incident_detector import check_run
 
     db_path = tmp_path / "test.db"
     conn = get_db(db_path=db_path)

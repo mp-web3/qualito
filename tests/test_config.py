@@ -4,14 +4,14 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from dqi.cli.main import cli
-from dqi.config import DqiConfig, load_config, init_project
+from qualito.cli.main import cli
+from qualito.config import QualityConfig, load_config, init_project
 
 
-def test_dqi_config_defaults():
+def test_quality_config_defaults():
     """Default config values are sensible."""
-    config = DqiConfig()
-    assert config.db_path == Path(".dqi/dqi.db")
+    config = QualityConfig()
+    assert config.db_path == Path(".qualito/qualito.db")
     assert config.slo_quality == 0.60
     assert config.slo_availability == 0.95
     assert config.slo_cost == 3.00
@@ -22,14 +22,14 @@ def test_load_config_no_files(tmp_path):
     """load_config works when no config files exist."""
     config = load_config(project_dir=tmp_path)
     assert config.workspace == tmp_path.name
-    assert config.db_path == Path(".dqi/dqi.db")
+    assert config.db_path == Path(".qualito/qualito.db")
 
 
 def test_load_config_reads_project_toml(tmp_path):
-    """load_config reads project .dqi/config.toml."""
-    dqi_dir = tmp_path / ".dqi"
-    dqi_dir.mkdir()
-    (dqi_dir / "config.toml").write_text('workspace = "my-project"\nslo_cost = 5.00\n')
+    """load_config reads project .qualito/config.toml."""
+    qualito_dir = tmp_path / ".qualito"
+    qualito_dir.mkdir()
+    (qualito_dir / "config.toml").write_text('workspace = "my-project"\nslo_cost = 5.00\n')
 
     config = load_config(project_dir=tmp_path)
     assert config.workspace == "my-project"
@@ -38,12 +38,12 @@ def test_load_config_reads_project_toml(tmp_path):
 
 
 def test_init_project_creates_files(tmp_path):
-    """init_project creates .dqi/, config.toml, and database."""
-    config, dqi_dir = init_project(project_dir=tmp_path)
+    """init_project creates .qualito/, config.toml, and database."""
+    config, qualito_dir = init_project(project_dir=tmp_path)
 
-    assert dqi_dir == tmp_path / ".dqi"
-    assert dqi_dir.exists()
-    assert (dqi_dir / "config.toml").exists()
+    assert qualito_dir == tmp_path / ".qualito"
+    assert qualito_dir.exists()
+    assert (qualito_dir / "config.toml").exists()
     assert (tmp_path / config.db_path).exists()
     assert config.workspace == tmp_path.name
 
@@ -53,7 +53,7 @@ def test_init_project_idempotent(tmp_path):
     init_project(project_dir=tmp_path)
 
     # Modify config
-    config_path = tmp_path / ".dqi" / "config.toml"
+    config_path = tmp_path / ".qualito" / "config.toml"
     config_path.write_text('workspace = "custom"\n')
 
     # Init again — should not overwrite
@@ -62,17 +62,17 @@ def test_init_project_idempotent(tmp_path):
 
 
 def test_cli_init(tmp_path):
-    """dqi init creates .dqi/ directory."""
+    """qualito init creates .qualito/ directory."""
     runner = CliRunner()
     result = runner.invoke(cli, ["init", "--dir", str(tmp_path)])
     assert result.exit_code == 0
-    assert "Initialized DQI" in result.output
-    assert (tmp_path / ".dqi" / "config.toml").exists()
-    assert (tmp_path / ".dqi" / "dqi.db").exists()
+    assert "Initialized Qualito" in result.output
+    assert (tmp_path / ".qualito" / "config.toml").exists()
+    assert (tmp_path / ".qualito" / "qualito.db").exists()
 
 
 def test_cli_status_not_initialized(tmp_path):
-    """dqi status fails when not initialized."""
+    """qualito status fails when not initialized."""
     runner = CliRunner()
     result = runner.invoke(cli, ["status", "--dir", str(tmp_path)])
     assert result.exit_code == 1
@@ -80,7 +80,7 @@ def test_cli_status_not_initialized(tmp_path):
 
 
 def test_cli_status_after_init(tmp_path):
-    """dqi status shows correct info after init."""
+    """qualito status shows correct info after init."""
     runner = CliRunner()
     runner.invoke(cli, ["init", "--dir", str(tmp_path)])
     result = runner.invoke(cli, ["status", "--dir", str(tmp_path)])
