@@ -1,6 +1,6 @@
 [project]
 name = "qualito"
-version = "0.1.0"
+version = "0.1.1"
 description = "Quality metrics for AI-assisted development — measure and improve your Claude Code sessions"
 readme = "README.md"
 license = "MIT"
@@ -49,6 +49,7 @@ all = [
 dev = [
     "pytest>=8.0",
     "ruff>=0.4,<0.15.9",
+    "httpx>=0.27",
 ]
 
 [project.scripts]

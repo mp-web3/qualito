@@ -1,7 +1,7 @@
 """Qualito MCP server — quality metrics for AI-assisted development.
 
-7 tools: dqi_score, dqi_cost, dqi_patterns, dqi_warnings,
-dqi_templates, dqi_incidents, dqi_slo.
+8 tools: dqi_score, dqi_cost, dqi_patterns, dqi_warnings,
+dqi_templates, dqi_incidents, dqi_slo, qualito_setup.
 stdio transport. Never print() to stdout. All tools return str (JSON).
 """
 
@@ -610,6 +610,110 @@ def dqi_slo(workspace: str = "") -> str:
         }, indent=2)
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Tool 8: qualito_setup
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def qualito_setup() -> str:
+    """Scan for Claude Code sessions and return setup overview.
+
+    Returns one of three states:
+    - "configured": ~/.qualito/ exists with data — shows workspace stats.
+    - "not_configured": No data yet but Claude Code sessions found — shows
+      what can be imported and suggests running `uvx qualito setup`.
+    - "no_sessions": No Claude Code sessions found at all.
+
+    This tool is read-only and fast (no imports, no scoring).
+    """
+    from pathlib import Path
+
+    global_dir = Path.home() / ".qualito"
+    claude_projects_dir = Path.home() / ".claude" / "projects"
+
+    # Case A: Already configured — read stats from DB
+    if global_dir.exists() and (global_dir / "qualito.db").exists():
+        conn = _get_db()
+        try:
+            # Per-workspace stats
+            ws_rows = conn.execute("""
+                SELECT r.workspace,
+                       COUNT(r.id) as run_count,
+                       AVG(e.score) as avg_dqi,
+                       COALESCE(SUM(r.cost_usd), 0) as total_cost
+                FROM runs r
+                LEFT JOIN evaluations e ON e.run_id = r.id AND e.eval_type = 'dqi'
+                GROUP BY r.workspace
+                ORDER BY run_count DESC
+            """).fetchall()
+
+            workspaces = []
+            total_runs = 0
+            total_cost = 0.0
+            dqi_sum = 0.0
+            dqi_count = 0
+
+            for row in ws_rows:
+                run_count = row["run_count"]
+                avg_dqi = round(row["avg_dqi"], 2) if row["avg_dqi"] is not None else None
+                ws_cost = round(row["total_cost"], 2)
+
+                workspaces.append({
+                    "name": row["workspace"],
+                    "run_count": run_count,
+                    "avg_dqi": avg_dqi,
+                    "total_cost": ws_cost,
+                })
+                total_runs += run_count
+                total_cost += ws_cost
+                if avg_dqi is not None:
+                    dqi_sum += avg_dqi * run_count
+                    dqi_count += run_count
+
+            overall_avg_dqi = round(dqi_sum / dqi_count, 2) if dqi_count > 0 else None
+
+            return json.dumps({
+                "status": "configured",
+                "global_dir": str(global_dir),
+                "workspaces": workspaces,
+                "total_runs": total_runs,
+                "overall_avg_dqi": overall_avg_dqi,
+                "total_cost": round(total_cost, 2),
+            }, indent=2)
+        finally:
+            conn.close()
+
+    # Case B/C: Not configured — check for Claude Code sessions
+    if not claude_projects_dir.exists() or not any(claude_projects_dir.iterdir()):
+        return json.dumps({
+            "status": "no_sessions",
+            "message": "No Claude Code sessions found. Use Claude Code to generate session data first.",
+        }, indent=2)
+
+    # Case B: Sessions exist but not yet imported
+    from qualito.importer import discover_all_projects
+
+    projects = discover_all_projects(claude_projects_dir)
+    total_sessions = sum(p["session_count"] for p in projects)
+
+    discovered = [
+        {
+            "name": p["name"],
+            "folder": p["folder"],
+            "session_count": p["session_count"],
+        }
+        for p in projects
+        if p["session_count"] > 0
+    ]
+
+    return json.dumps({
+        "status": "not_configured",
+        "discovered_projects": discovered,
+        "total_sessions": total_sessions,
+        "suggestion": "Run `uvx qualito setup` to import and score these sessions",
+    }, indent=2)
 
 
 # ---------------------------------------------------------------------------

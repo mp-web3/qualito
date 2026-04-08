@@ -203,14 +203,20 @@ CREATE INDEX IF NOT EXISTS idx_incident_events_incident ON incident_events(incid
 def _resolve_db_path(db_path: Path | None = None) -> Path:
     """Resolve the database file path.
 
-    Priority: explicit path > QUALITO_DIR env var > cwd/.qualito/qualito.db
+    Priority: explicit path > QUALITO_DIR env var > global ~/.qualito/qualito.db
+    Falls back to cwd/.qualito/qualito.db only if it exists (backward compat).
     """
     if db_path:
         return db_path
     qualito_dir = os.environ.get("QUALITO_DIR")
     if qualito_dir:
         return Path(qualito_dir) / "qualito.db"
-    return Path.cwd() / ".qualito" / "qualito.db"
+    # Check local .qualito/ first for backward compat
+    local_db = Path.cwd() / ".qualito" / "qualito.db"
+    if local_db.exists():
+        return local_db
+    # Default to global
+    return Path.home() / ".qualito" / "qualito.db"
 
 
 def get_db(db_path: Path | None = None) -> sqlite3.Connection:

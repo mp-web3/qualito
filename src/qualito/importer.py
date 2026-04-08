@@ -245,6 +245,145 @@ def import_session(
     }
 
 
+def _folder_to_display_name(folder_name: str) -> str:
+    """Derive a human-readable project name from a Claude projects folder name.
+
+    Algorithm: strip leading dash, replace dashes with path separators,
+    take the last path component.
+
+    Examples:
+        -Users-mattiapapa-qualito -> qualito
+        -home-user-my-project -> my-project  (no, actually: project)
+    """
+    # Strip leading dash
+    name = folder_name.lstrip("-")
+    # Replace dashes with path separators
+    parts = name.split("-")
+    # Reconstruct as path and take last component
+    # This is a heuristic — project dirs with hyphens lose those hyphens
+    if parts:
+        return parts[-1]
+    return folder_name
+
+
+def discover_all_projects(
+    claude_projects_dir: Path | None = None,
+) -> list[dict]:
+    """Scan Claude Code projects directory and return discoverable projects.
+
+    Each project folder in ~/.claude/projects/ corresponds to a workspace
+    the user has used Claude Code in. Folder names encode the absolute path
+    (e.g. -Users-mattiapapa-qualito for /Users/mattiapapa/qualito).
+
+    Args:
+        claude_projects_dir: Override for testing. Defaults to ~/.claude/projects/.
+
+    Returns:
+        List of dicts: {name, path, session_count, estimated_cost}.
+    """
+    if claude_projects_dir is None:
+        claude_projects_dir = CLAUDE_PROJECTS_DIR
+
+    if not claude_projects_dir.exists():
+        return []
+
+    projects = []
+    for entry in sorted(claude_projects_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+
+        folder_name = entry.name
+        display_name = _folder_to_display_name(folder_name)
+
+        # Count session files (top-level JSONL only, exclude subagent dirs)
+        session_files = list(entry.glob("*.jsonl"))
+        session_count = len(session_files)
+
+        # Quick cost estimate from file sizes (rough: ~$0.01 per KB of JSONL)
+        # More accurate: parse a few files. For discovery, just count sessions.
+        estimated_cost = None
+        if session_count > 0:
+            total_size = sum(f.stat().st_size for f in session_files)
+            # Very rough heuristic: average session costs ~$0.50-$2.00
+            # Better to leave None and let import compute actual costs
+            estimated_cost = None
+
+        projects.append({
+            "name": display_name,
+            "path": str(entry),
+            "folder": folder_name,
+            "session_count": session_count,
+            "estimated_cost": estimated_cost,
+        })
+
+    return projects
+
+
+def import_project(
+    project_key: str,
+    workspace_name: str,
+    conn: sqlite3.Connection,
+    date_range: tuple | None = None,
+    claude_projects_dir: Path | None = None,
+) -> dict:
+    """Import sessions from a specific Claude Code project folder into the DB.
+
+    Args:
+        project_key: The folder name in ~/.claude/projects/ (e.g. -Users-mattiapapa-qualito).
+        workspace_name: Workspace name to assign to imported runs.
+        conn: Database connection.
+        date_range: Optional (start, end) ISO date strings to filter sessions by modification time.
+        claude_projects_dir: Override for testing. Defaults to ~/.claude/projects/.
+
+    Returns:
+        Summary dict {imported, skipped, total_cost, avg_dqi}.
+    """
+    if claude_projects_dir is None:
+        claude_projects_dir = CLAUDE_PROJECTS_DIR
+
+    project_dir = claude_projects_dir / project_key
+    if not project_dir.exists():
+        return {"imported": 0, "skipped": 0, "total_cost": 0.0, "avg_dqi": 0.0}
+
+    session_files = sorted(project_dir.glob("*.jsonl"))
+
+    # Filter by date range if specified
+    if date_range:
+        start_str, end_str = date_range
+        filtered = []
+        for f in session_files:
+            mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d")
+            if start_str and mtime < start_str:
+                continue
+            if end_str and mtime > end_str:
+                continue
+            filtered.append(f)
+        session_files = filtered
+
+    imported = 0
+    skipped = 0
+    total_cost = 0.0
+    dqi_sum = 0.0
+
+    for f in session_files:
+        result = import_session(conn, f, workspace_name)
+        if result is None:
+            skipped += 1
+        else:
+            imported += 1
+            total_cost += result.get("cost") or 0
+            dqi_sum += result.get("dqi") or 0
+
+    avg_dqi = (dqi_sum / imported) if imported > 0 else 0.0
+
+    return {
+        "imported": imported,
+        "skipped": skipped,
+        "total_cost": round(total_cost, 4),
+        "avg_dqi": round(avg_dqi, 4),
+    }
+
+
 def import_all(
     conn: sqlite3.Connection,
     project_dir: Path | None = None,

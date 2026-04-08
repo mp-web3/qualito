@@ -15,7 +15,7 @@ from pathlib import Path
 class QualityConfig:
     """Qualito configuration."""
 
-    db_path: Path = field(default_factory=lambda: Path(".qualito/qualito.db"))
+    db_path: Path = field(default_factory=lambda: Path.home() / ".qualito" / "qualito.db")
     workspace: str = ""
     slo_quality: float = 0.60
     slo_availability: float = 0.95
@@ -26,6 +26,13 @@ class QualityConfig:
 # Backward compat alias
 DqiConfig = QualityConfig
 
+
+def get_global_dir() -> Path:
+    """Return the global Qualito directory (~/.qualito/), creating it if missing."""
+    global_dir = Path.home() / ".qualito"
+    global_dir.mkdir(parents=True, exist_ok=True)
+    return global_dir
+
 # Keys that map to Path fields
 _PATH_KEYS = {"db_path", "templates_dir"}
 
@@ -35,7 +42,7 @@ def _apply_toml(config: QualityConfig, data: dict) -> None:
     for key, value in data.items():
         if hasattr(config, key):
             if key in _PATH_KEYS and value is not None:
-                setattr(config, key, Path(value))
+                setattr(config, key, Path(value).expanduser())
             else:
                 setattr(config, key, value)
 
@@ -82,10 +89,34 @@ db_path = ".qualito/qualito.db"
     path.write_text(content)
 
 
+def _write_global_config(path: Path) -> None:
+    """Write a default global config.toml file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = """\
+# Qualito Global Configuration
+# Applies to all projects. Per-project .qualito/config.toml overrides these.
+
+# SLO thresholds
+slo_quality = 0.60
+slo_availability = 0.95
+slo_cost = 3.00
+
+# Database path (global, shared across all projects)
+db_path = "~/.qualito/qualito.db"
+
+# Custom templates directory (optional)
+# templates_dir = "~/.qualito/templates"
+"""
+    path.write_text(content)
+
+
 def load_config(project_dir: Path | None = None) -> QualityConfig:
     """Load Qualito config, merging global and project settings.
 
     Priority: env vars > project .qualito/config.toml > global ~/.qualito/config.toml > defaults.
+
+    The default db_path is ~/.qualito/qualito.db (global). A project-level
+    config can override this to a local path.
 
     Args:
         project_dir: Project root. Defaults to cwd.
@@ -119,13 +150,15 @@ def load_config(project_dir: Path | None = None) -> QualityConfig:
     return config
 
 
-def init_project(project_dir: Path | None = None) -> tuple[QualityConfig, Path]:
-    """Initialize Qualito in a project directory.
+def init_project(project_dir: Path | None = None, *, local: bool = False) -> tuple[QualityConfig, Path]:
+    """Initialize Qualito, either globally (~/.qualito/) or locally (.qualito/).
 
-    Creates .qualito/ directory, config.toml, and empty database.
+    Global mode (default): Creates ~/.qualito/ with config.toml and database.
+    Local mode (--local): Creates .qualito/ in the project directory (backward compat).
 
     Args:
         project_dir: Project root. Defaults to cwd.
+        local: If True, create per-project .qualito/ instead of global.
 
     Returns:
         Tuple of (config, qualito_dir_path).
@@ -133,7 +166,11 @@ def init_project(project_dir: Path | None = None) -> tuple[QualityConfig, Path]:
     if project_dir is None:
         project_dir = Path.cwd()
 
-    qualito_dir = project_dir / ".qualito"
+    if local:
+        qualito_dir = project_dir / ".qualito"
+    else:
+        qualito_dir = get_global_dir()
+
     qualito_dir.mkdir(parents=True, exist_ok=True)
 
     # Detect workspace
@@ -142,7 +179,10 @@ def init_project(project_dir: Path | None = None) -> tuple[QualityConfig, Path]:
     # Write config
     config_path = qualito_dir / "config.toml"
     if not config_path.exists():
-        _write_default_config(config_path, workspace)
+        if local:
+            _write_default_config(config_path, workspace)
+        else:
+            _write_global_config(config_path)
 
     # Load config (picks up what we just wrote)
     config = load_config(project_dir)

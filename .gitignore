@@ -21,7 +21,8 @@ htmlcov/
 *.swp
 *.swo
 
-# DQI local data
+# Qualito local data
+.qualito/
 .dqi/
 
 # Environment files

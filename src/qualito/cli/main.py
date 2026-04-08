@@ -1,6 +1,7 @@
 """Qualito CLI entry point."""
 
 import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -10,12 +11,17 @@ from qualito import __version__
 
 
 def _get_conn(project_dir: Path | None = None):
-    """Resolve config and return a DB connection + config."""
+    """Resolve config and return a DB connection + config.
+
+    Checks for global ~/.qualito/ first, then local .qualito/ for backward compat.
+    """
     if project_dir is None:
         project_dir = Path.cwd()
 
-    qualito_dir = project_dir / ".qualito"
-    if not qualito_dir.exists():
+    global_dir = Path.home() / ".qualito"
+    local_dir = project_dir / ".qualito"
+
+    if not global_dir.exists() and not local_dir.exists():
         click.echo("Qualito not initialized. Run 'qualito init' first.")
         raise SystemExit(1)
 
@@ -28,8 +34,8 @@ def _get_conn(project_dir: Path | None = None):
         db_path = project_dir / db_path
 
     if not db_path.exists():
-        click.echo("No database found. Run some delegations first.")
-        raise SystemExit(1)
+        # Try creating the DB (first run after init)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
 
     conn = get_db(db_path=db_path)
     return conn, config
@@ -61,11 +67,470 @@ def cli():
     pass
 
 
+# ---------------------------------------------------------------------------
+# Setup helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_workspace_summary(conn) -> list[dict]:
+    """Query per-workspace summary: run count, avg DQI, total cost."""
+    rows = conn.execute("""
+        SELECT r.workspace,
+               COUNT(*) as run_count,
+               AVG(e.score) as avg_dqi,
+               COALESCE(SUM(r.cost_usd), 0) as total_cost
+        FROM runs r
+        LEFT JOIN evaluations e ON e.run_id = r.id AND e.eval_type = 'dqi'
+        GROUP BY r.workspace
+        ORDER BY r.workspace
+    """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _dqi_label(score: float | None) -> str:
+    """Return a human-readable DQI label."""
+    if score is None:
+        return "N/A"
+    if score >= 0.8:
+        return "Excellent"
+    if score >= 0.7:
+        return "Good"
+    if score >= 0.5:
+        return "Fair"
+    return "Needs attention"
+
+
+def _parse_selection(text: str, max_n: int) -> list[int] | None:
+    """Parse user selection like '1,3,5' or 'all' or 'none'.
+
+    Returns list of 0-based indices, or None for 'none'.
+    """
+    text = text.strip().lower()
+    if text == "all":
+        return list(range(max_n))
+    if text == "none":
+        return None
+    indices = []
+    for part in text.split(","):
+        part = part.strip()
+        if part.isdigit():
+            idx = int(part) - 1  # 1-based to 0-based
+            if 0 <= idx < max_n:
+                indices.append(idx)
+    return indices if indices else None
+
+
+def _compute_date_range(choice: str) -> tuple[str, str] | None:
+    """Convert date range choice to (start, end) ISO strings or None for all time."""
+    now = datetime.now()
+    if choice == "b":
+        start = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+        return (start, now.strftime("%Y-%m-%d"))
+    elif choice == "c":
+        start = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        return (start, now.strftime("%Y-%m-%d"))
+    elif choice == "d":
+        start = click.prompt("Start date (YYYY-MM-DD)")
+        end = click.prompt("End date (YYYY-MM-DD)", default=now.strftime("%Y-%m-%d"))
+        return (start, end)
+    return None  # all time
+
+
+def safe_add_mcp_to_claude_json() -> bool:
+    """Add qualito MCP server to ~/.claude.json if not already present.
+
+    Returns True if added, False otherwise.
+    """
+    target = Path.home() / ".claude.json"
+    mcp_entry = {
+        "command": "uvx",
+        "args": ["--from", "qualito[mcp]", "qualito-mcp"],
+    }
+
+    if not target.exists():
+        data = {"mcpServers": {"qualito": mcp_entry}}
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        os.rename(tmp, target)
+        click.echo("Added qualito to ~/.claude.json. Restart Claude Code to activate.")
+        return True
+
+    raw = target.read_text()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        click.echo("Warning: ~/.claude.json is malformed. Add MCP server manually:")
+        click.echo('  "mcpServers": { "qualito": { "command": "uvx", '
+                   '"args": ["--from", "qualito[mcp]", "qualito-mcp"] } }')
+        return False
+
+    if not isinstance(data, dict):
+        data = {"mcpServers": {}}
+
+    mcp_servers = data.get("mcpServers", {})
+    if "qualito" in mcp_servers:
+        click.echo("MCP server already configured in ~/.claude.json.")
+        return False
+
+    if "mcpServers" not in data:
+        data["mcpServers"] = {}
+    data["mcpServers"]["qualito"] = mcp_entry
+
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.rename(tmp, target)
+    click.echo("Added qualito to ~/.claude.json. Restart Claude Code to activate.")
+    return True
+
+
+def _display_results_table(summaries: list[dict]):
+    """Display workspace results table."""
+    if not summaries:
+        click.echo("No data to display.")
+        return
+
+    click.echo(f"\n{'Workspace':<25} {'Runs':>6} {'Avg DQI':>10} {'Cost':>10}")
+    click.echo("-" * 55)
+    all_dqi = []
+    for s in summaries:
+        ws = (s["workspace"] or "?")[:23]
+        runs = s["run_count"]
+        avg = s["avg_dqi"]
+        cost = s["total_cost"]
+        if avg is not None:
+            all_dqi.append(avg)
+        dqi_str = f"{avg:.3f}" if avg is not None else "N/A"
+        click.echo(f"{ws:<25} {runs:>6} {dqi_str:>10} {_fmt_cost(cost):>10}")
+    click.echo("-" * 55)
+
+    overall_avg = sum(all_dqi) / len(all_dqi) if all_dqi else None
+    if overall_avg is not None:
+        label = _dqi_label(overall_avg)
+        click.echo(
+            f"\nAverage DQI: {overall_avg:.2f} ({label}) — "
+            f"scores 0-1. Above 0.7 is good, below 0.5 needs attention."
+        )
+
+
+# ---------------------------------------------------------------------------
+# qualito setup
+# ---------------------------------------------------------------------------
+
+
+def _run_interactive_setup_first_run():
+    """First-run setup: init, discover, import, score, MCP config."""
+    from qualito.config import init_project
+    from qualito.core.db import get_db
+    from qualito.importer import discover_all_projects, import_project
+
+    # 1. Init global directory
+    click.echo("Initializing Qualito...\n")
+    config, qualito_dir = init_project(local=False)
+    db_path = config.db_path
+    if not db_path.is_absolute():
+        db_path = Path.cwd() / db_path
+
+    # 2. Discover projects
+    projects = discover_all_projects()
+    if not projects:
+        click.echo("No Claude Code projects found in ~/.claude/projects/")
+        click.echo("Use Claude Code in a project first, then run 'qualito setup' again.")
+        return
+
+    # 3. Display table
+    click.echo(f"Found {len(projects)} Claude Code project(s):\n")
+    click.echo(f"  {'#':<4} {'Project':<30} {'Sessions':>10}")
+    click.echo("  " + "-" * 48)
+    for i, p in enumerate(projects, 1):
+        click.echo(f"  {i:<4} {p['name']:<30} {p['session_count']:>10}")
+    click.echo()
+
+    # 4. Select projects
+    selection_text = click.prompt(
+        "Select projects [1-N, all, none]", default="all"
+    )
+    selected_indices = _parse_selection(selection_text, len(projects))
+    if selected_indices is None:
+        click.echo("No projects selected.")
+        return
+    selected = [projects[i] for i in selected_indices]
+
+    # 5. Date range
+    click.echo("\nImport date range?")
+    click.echo("  a) All time")
+    click.echo("  b) Last 30 days")
+    click.echo("  c) Last 7 days")
+    click.echo("  d) Custom")
+    date_choice = click.prompt("Choice", default="a")
+    date_range = _compute_date_range(date_choice)
+
+    # 6. Workspace naming
+    click.echo()
+    workspace_names = {}
+    for p in selected:
+        default_name = p["name"]
+        name = click.prompt(
+            f"  {p['name']} → workspace name",
+            default=default_name,
+        )
+        workspace_names[p["folder"]] = name
+
+    # 7. Import with progress
+    click.echo("\nImporting sessions...")
+    conn = get_db(db_path=db_path)
+    try:
+        total_imported = 0
+        total_skipped = 0
+        with click.progressbar(selected, label="  Importing", show_pos=True) as bar:
+            for p in bar:
+                ws_name = workspace_names[p["folder"]]
+                result = import_project(
+                    project_key=p["folder"],
+                    workspace_name=ws_name,
+                    conn=conn,
+                    date_range=date_range,
+                )
+                total_imported += result["imported"]
+                total_skipped += result["skipped"]
+
+        click.echo(f"\n  Imported {total_imported} sessions, skipped {total_skipped}")
+
+        # 8. Display results
+        if total_imported > 0:
+            summaries = _get_workspace_summary(conn)
+            _display_results_table(summaries)
+    finally:
+        conn.close()
+
+    # 9. MCP config
+    click.echo()
+    if click.confirm("Add MCP server for in-editor access?", default=True):
+        safe_add_mcp_to_claude_json()
+
+    click.echo("\nSetup complete. Run 'qualito setup' anytime to add more projects.")
+
+
+def _run_interactive_setup_rerun():
+    """Re-run setup: show current state, offer options."""
+    from qualito.config import load_config
+    from qualito.core.db import get_db
+    from qualito.importer import discover_all_projects, import_project
+
+    config = load_config()
+    db_path = config.db_path
+    if not db_path.is_absolute():
+        db_path = Path.cwd() / db_path
+
+    conn = get_db(db_path=db_path)
+    try:
+        # Show current state
+        run_count = conn.execute("SELECT COUNT(*) as n FROM runs").fetchone()["n"]
+        ws_count = conn.execute(
+            "SELECT COUNT(DISTINCT workspace) as n FROM runs"
+        ).fetchone()["n"]
+        click.echo(
+            f"Found existing Qualito config. "
+            f"{ws_count} workspace(s), {run_count} runs imported.\n"
+        )
+
+        # Menu
+        click.echo("  a) Add more projects")
+        click.echo("  b) Re-import everything")
+        click.echo("  c) Re-score existing runs")
+        click.echo("  d) Exit")
+        choice = click.prompt("Choice", default="a")
+
+        if choice == "d":
+            return
+
+        if choice == "c":
+            # Re-score existing runs
+            click.echo("\nRe-scoring existing runs...")
+            from qualito.core.dqi import store_dqi
+            from qualito.core.evaluator import auto_evaluate
+
+            runs = conn.execute("SELECT id FROM runs").fetchall()
+            with click.progressbar(runs, label="  Scoring", show_pos=True) as bar:
+                for r in bar:
+                    auto_evaluate(r["id"], conn=conn)
+                    store_dqi(r["id"], conn=conn)
+
+            summaries = _get_workspace_summary(conn)
+            _display_results_table(summaries)
+            return
+
+        if choice == "b":
+            # Re-import everything (idempotent)
+            projects = discover_all_projects()
+            if not projects:
+                click.echo("No Claude Code projects found.")
+                return
+
+            click.echo(f"\nRe-importing {len(projects)} project(s)...")
+            total_imported = 0
+            total_skipped = 0
+            with click.progressbar(projects, label="  Importing", show_pos=True) as bar:
+                for p in bar:
+                    result = import_project(
+                        project_key=p["folder"],
+                        workspace_name=p["name"],
+                        conn=conn,
+                    )
+                    total_imported += result["imported"]
+                    total_skipped += result["skipped"]
+
+            click.echo(
+                f"\n  Imported {total_imported} new sessions, "
+                f"skipped {total_skipped}"
+            )
+            summaries = _get_workspace_summary(conn)
+            _display_results_table(summaries)
+            return
+
+        if choice == "a":
+            # Add more — filter out already-imported workspaces
+            projects = discover_all_projects()
+            if not projects:
+                click.echo("No Claude Code projects found.")
+                return
+
+            existing_ws = {
+                r["workspace"]
+                for r in conn.execute(
+                    "SELECT DISTINCT workspace FROM runs"
+                ).fetchall()
+            }
+            new_projects = [p for p in projects if p["name"] not in existing_ws]
+
+            if not new_projects:
+                click.echo("All discovered projects are already imported.")
+                return
+
+            click.echo(f"\nFound {len(new_projects)} new project(s):\n")
+            click.echo(f"  {'#':<4} {'Project':<30} {'Sessions':>10}")
+            click.echo("  " + "-" * 48)
+            for i, p in enumerate(new_projects, 1):
+                click.echo(
+                    f"  {i:<4} {p['name']:<30} {p['session_count']:>10}"
+                )
+            click.echo()
+
+            selection_text = click.prompt(
+                "Select projects [1-N, all, none]", default="all"
+            )
+            selected_indices = _parse_selection(
+                selection_text, len(new_projects)
+            )
+            if selected_indices is None:
+                click.echo("No projects selected.")
+                return
+            selected = [new_projects[i] for i in selected_indices]
+
+            # Workspace naming
+            workspace_names = {}
+            for p in selected:
+                name = click.prompt(
+                    f"  {p['name']} → workspace name",
+                    default=p["name"],
+                )
+                workspace_names[p["folder"]] = name
+
+            click.echo("\nImporting...")
+            total_imported = 0
+            with click.progressbar(
+                selected, label="  Importing", show_pos=True
+            ) as bar:
+                for p in bar:
+                    ws_name = workspace_names[p["folder"]]
+                    result = import_project(
+                        project_key=p["folder"],
+                        workspace_name=ws_name,
+                        conn=conn,
+                    )
+                    total_imported += result["imported"]
+
+            click.echo(f"\n  Imported {total_imported} new sessions")
+            summaries = _get_workspace_summary(conn)
+            _display_results_table(summaries)
+    finally:
+        conn.close()
+
+
+@cli.command()
+@click.argument("token", required=False)
+def setup(token):
+    """Set up Qualito — discover and import Claude Code sessions.
+
+    With TOKEN: cloud setup (coming soon, falls back to local import-all).
+    Without TOKEN: interactive guided setup.
+    """
+    if token:
+        # Auto setup with token — cloud not built yet, run import-all
+        click.echo(
+            "Cloud setup will be available after deployment. "
+            "Running local setup...\n"
+        )
+        from qualito.config import init_project
+        from qualito.core.db import get_db
+        from qualito.importer import discover_all_projects, import_project
+
+        config, qualito_dir = init_project(local=False)
+        db_path = config.db_path
+        if not db_path.is_absolute():
+            db_path = Path.cwd() / db_path
+
+        projects = discover_all_projects()
+        if not projects:
+            click.echo("No Claude Code projects found in ~/.claude/projects/")
+            return
+
+        click.echo(f"Found {len(projects)} project(s). Importing all...\n")
+        conn = get_db(db_path=db_path)
+        try:
+            total_imported = 0
+            total_skipped = 0
+            for p in projects:
+                result = import_project(
+                    project_key=p["folder"],
+                    workspace_name=p["name"],
+                    conn=conn,
+                )
+                total_imported += result["imported"]
+                total_skipped += result["skipped"]
+
+            click.echo(
+                f"Imported {total_imported} sessions, skipped {total_skipped}"
+            )
+            if total_imported > 0:
+                summaries = _get_workspace_summary(conn)
+                _display_results_table(summaries)
+        finally:
+            conn.close()
+
+        # Auto-configure MCP
+        safe_add_mcp_to_claude_json()
+        click.echo("\nSetup complete.")
+    else:
+        # Interactive setup
+        global_dir = Path.home() / ".qualito"
+        if global_dir.exists() and (global_dir / "config.toml").exists():
+            _run_interactive_setup_rerun()
+        else:
+            _run_interactive_setup_first_run()
+
+
+# ---------------------------------------------------------------------------
+# qualito init
+# ---------------------------------------------------------------------------
+
+
 @cli.command()
 @click.option("--dir", "project_dir", type=click.Path(exists=True, path_type=Path),
               default=None, help="Project directory (default: cwd)")
-def init(project_dir: Path | None):
-    """Initialize Qualito in the current project."""
+@click.option("--local", is_flag=True, default=False,
+              help="Create per-project .qualito/ instead of global ~/.qualito/")
+def init(project_dir: Path | None, local: bool):
+    """Initialize Qualito (global ~/.qualito/ by default, --local for per-project)."""
     if project_dir is None:
         project_dir = Path.cwd()
 
@@ -80,9 +545,10 @@ def init(project_dir: Path | None):
     if (project_dir / ".claude").is_dir():
         markers.append(".claude/")
 
-    config, qualito_dir = init_project(project_dir)
+    config, qualito_dir = init_project(project_dir, local=local)
 
-    click.echo(f"Initialized Qualito in {project_dir}")
+    mode = "local" if local else "global"
+    click.echo(f"Initialized Qualito ({mode}) in {qualito_dir}")
     click.echo(f"  Workspace: {config.workspace}")
     click.echo(f"  DB: {config.db_path}")
     click.echo(f"  Config: {qualito_dir / 'config.toml'}")
@@ -100,8 +566,16 @@ def status(project_dir: Path | None):
     if project_dir is None:
         project_dir = Path.cwd()
 
-    qualito_dir = project_dir / ".qualito"
-    if not qualito_dir.exists():
+    global_dir = Path.home() / ".qualito"
+    local_dir = project_dir / ".qualito"
+
+    if local_dir.exists():
+        qualito_dir = local_dir
+        mode = "local"
+    elif global_dir.exists():
+        qualito_dir = global_dir
+        mode = "global"
+    else:
         click.echo("Qualito not initialized. Run 'qualito init' first.")
         raise SystemExit(1)
 
@@ -114,6 +588,7 @@ def status(project_dir: Path | None):
     if not db_path.is_absolute():
         db_path = project_dir / db_path
 
+    click.echo(f"Mode: {mode}")
     click.echo(f"Workspace: {config.workspace}")
     click.echo(f"Config: {qualito_dir / 'config.toml'}")
     click.echo(f"DB: {db_path} ({'exists' if db_path.exists() else 'missing'})")
@@ -144,21 +619,72 @@ def status(project_dir: Path | None):
 @click.option("--dir", "project_dir", type=click.Path(exists=True, path_type=Path),
               default=None, help="Project directory (default: cwd)")
 @click.option("--workspace", default=None, help="Override workspace name")
-def import_sessions(project_dir: Path | None, workspace: str | None):
+@click.option("--all-projects", is_flag=True, default=False,
+              help="Import all discovered Claude Code projects")
+def import_sessions(project_dir: Path | None, workspace: str | None, all_projects: bool):
     """Import existing Claude Code sessions into Qualito."""
     if project_dir is None:
         project_dir = Path.cwd()
 
-    qualito_dir = project_dir / ".qualito"
-    if not qualito_dir.exists():
+    from qualito.config import load_config
+    from qualito.core.db import get_db
+
+    config = load_config(project_dir)
+    db_path = config.db_path
+    if not db_path.is_absolute():
+        db_path = project_dir / db_path
+
+    if all_projects:
+        # Import all discovered projects into the global DB
+        from qualito.importer import discover_all_projects, import_project
+
+        projects = discover_all_projects()
+        if not projects:
+            click.echo("No Claude Code projects found in ~/.claude/projects/")
+            return
+
+        click.echo(f"Found {len(projects)} project(s):")
+        for p in projects:
+            click.echo(f"  {p['name']} ({p['session_count']} sessions)")
+
+        conn = get_db(db_path=db_path)
+        try:
+            total_imported = 0
+            total_skipped = 0
+            total_cost = 0.0
+
+            for p in projects:
+                ws_name = workspace or p["name"]
+                result = import_project(
+                    project_key=p["folder"],
+                    workspace_name=ws_name,
+                    conn=conn,
+                )
+                total_imported += result["imported"]
+                total_skipped += result["skipped"]
+                total_cost += result["total_cost"]
+                if result["imported"] > 0:
+                    click.echo(
+                        f"  {p['name']}: imported {result['imported']}, "
+                        f"skipped {result['skipped']}, "
+                        f"cost ${result['total_cost']:.2f}"
+                    )
+
+            click.echo(f"\nTotal: imported {total_imported}, "
+                       f"skipped {total_skipped}, cost ${total_cost:.2f}")
+        finally:
+            conn.close()
+        return
+
+    # Single-project import (original behavior)
+    global_dir = Path.home() / ".qualito"
+    local_dir = project_dir / ".qualito"
+    if not global_dir.exists() and not local_dir.exists():
         click.echo("Qualito not initialized. Run 'qualito init' first.")
         raise SystemExit(1)
 
-    from qualito.config import load_config
-    from qualito.core.db import get_db
     from qualito.importer import find_session_files, import_all
 
-    config = load_config(project_dir)
     ws = workspace or config.workspace or "default"
 
     # Show discoverable sessions first
@@ -170,12 +696,7 @@ def import_sessions(project_dir: Path | None, workspace: str | None):
 
     click.echo(f"Found {len(files)} session file(s) for {project_dir}")
 
-    # Get DB connection
-    db_path = config.db_path
-    if not db_path.is_absolute():
-        db_path = project_dir / db_path
     conn = get_db(db_path=db_path)
-
     try:
         result = import_all(conn, project_dir=project_dir, workspace=ws)
 
