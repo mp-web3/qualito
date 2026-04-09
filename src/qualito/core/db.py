@@ -10,6 +10,304 @@ import os
 import sqlite3
 from pathlib import Path
 
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    create_engine,
+    func,
+)
+from sqlalchemy import false as sa_false
+
+# ---------------------------------------------------------------------------
+# SQLAlchemy Core table definitions (Phase 1 — PostgreSQL migration)
+# ---------------------------------------------------------------------------
+
+metadata = MetaData()
+
+runs_table = Table(
+    "runs",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("workspace", String, nullable=False, index=True),
+    Column("task", String, nullable=False),
+    Column("task_type", String),
+    Column("model", String),
+    Column("pipeline_mode", String, server_default="single"),
+    Column("status", String, index=True),
+    Column("summary", String),
+    Column("files_changed", String),
+    Column("cost_usd", Float),
+    Column("input_tokens", Integer),
+    Column("output_tokens", Integer),
+    Column("cache_read_tokens", Integer),
+    Column("duration_ms", Integer),
+    Column("branch", String),
+    Column("prompt", String),
+    Column("original_prompt", String),
+    Column("started_at", String, nullable=False),
+    Column("completed_at", String),
+    Column("researcher_summary", String),
+    Column("implementer_summary", String),
+    Column("verifier_verdict", String),
+    Column("paper_live_gap", Integer),
+    Column("skill_name", String),
+    Column("source", String, server_default="delegation"),
+    Column("prompt_components", String),
+)
+
+tool_calls_table = Table(
+    "tool_calls",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("run_id", String, ForeignKey("runs.id"), nullable=False, index=True),
+    Column("tool_name", String, nullable=False),
+    Column("arguments_summary", String),
+    Column("result_summary", String),
+    Column("is_error", Boolean, server_default=sa_false()),
+    Column("phase", String, server_default="single"),
+    Column("timestamp", String),
+    Column("duration_ms", Integer),
+)
+
+file_activity_table = Table(
+    "file_activity",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("run_id", String, ForeignKey("runs.id"), nullable=False, index=True),
+    Column("file_path", String, nullable=False),
+    Column("action", String, nullable=False),
+    Column("timestamp", String),
+)
+
+evaluations_table = Table(
+    "evaluations",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("run_id", String, ForeignKey("runs.id"), nullable=False, index=True),
+    Column("eval_type", String, nullable=False),
+    Column("checks", String),
+    Column("score", Float),
+    Column("categories", String),
+    Column("notes", String),
+    Column("created_at", String, server_default=func.now()),
+)
+
+artifacts_table = Table(
+    "artifacts",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("run_id", String, ForeignKey("runs.id"), nullable=False, index=True),
+    Column("artifact_type", String, nullable=False, index=True),
+    Column("title", String, nullable=False),
+    Column("content", String),
+    Column("content_type", String, server_default="text/markdown"),
+    Column("file_path", String),
+    Column("metadata", String),
+    Column("phase", String),
+    Column("workspace", String, index=True),
+    Column("created_at", String, nullable=False, server_default=func.now()),
+)
+
+baselines_table = Table(
+    "baselines",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String, nullable=False),
+    Column("description", String),
+    Column("window_start", String, nullable=False),
+    Column("window_end", String, nullable=False),
+    Column("run_count", Integer),
+    Column("metrics", String, nullable=False),
+    Column("created_at", String, server_default=func.now()),
+)
+
+system_changes_table = Table(
+    "system_changes",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("change_name", String, nullable=False),
+    Column("description", String),
+    Column("baseline_id", Integer, ForeignKey("baselines.id")),
+    Column("implemented_at", String, nullable=False),
+    Column("measurement_window_days", Integer, server_default="10"),
+    Column("status", String, server_default="measuring"),
+    Column("before_metrics", String),
+    Column("after_metrics", String),
+    Column("p_improvement", Float),
+    Column("effect_size", Float),
+    Column("created_at", String, server_default=func.now()),
+)
+
+benchmark_suites_table = Table(
+    "benchmark_suites",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String, nullable=False, unique=True),
+    Column("description", String),
+    Column("tasks", String, nullable=False),
+    Column("created_at", String, server_default=func.now()),
+)
+
+experiments_table = Table(
+    "experiments",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String, nullable=False, unique=True),
+    Column("description", String),
+    Column("suite_id", Integer, ForeignKey("benchmark_suites.id"), nullable=False),
+    Column("status", String, server_default="running"),
+    Column("run_ids", String),
+    Column("avg_dqi", Float),
+    Column("per_task_dqi", String),
+    Column("config_snapshot", String),
+    Column("created_at", String, server_default=func.now()),
+    Column("completed_at", String),
+)
+
+experiment_comparisons_table = Table(
+    "experiment_comparisons",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String, nullable=False),
+    Column(
+        "before_experiment_id",
+        Integer,
+        ForeignKey("experiments.id"),
+        nullable=False,
+    ),
+    Column(
+        "after_experiment_id",
+        Integer,
+        ForeignKey("experiments.id"),
+        nullable=False,
+    ),
+    Column("per_task_delta", String),
+    Column("wilcoxon_p", Float),
+    Column("bayesian_p_improvement", Float),
+    Column("effect_size", Float),
+    Column("verdict", String),
+    Column("created_at", String, server_default=func.now()),
+)
+
+incidents_table = Table(
+    "incidents",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("incident_key", String, unique=True, nullable=False),
+    Column("category", String, nullable=False, index=True),
+    Column("severity", String, nullable=False),
+    Column("status", String, nullable=False, server_default="detected", index=True),
+    Column("workspace", String, nullable=False, index=True),
+    Column("task_type", String),
+    Column("title", String, nullable=False),
+    Column("description", String),
+    Column("detection_method", String),
+    Column("trigger_metric", String),
+    Column("trigger_value", Float),
+    Column("baseline_value", Float),
+    Column("burn_rate", Float),
+    Column("affected_run_ids", String),
+    Column("total_affected_runs", Integer, server_default="0"),
+    Column("cost_impact_usd", Float, server_default="0"),
+    Column("fix_experiment_id", Integer, ForeignKey("experiments.id")),
+    Column("fix_description", String),
+    Column("resolution_type", String),
+    Column("created_at", String, server_default=func.now()),
+    Column("confirmed_at", String),
+    Column("resolved_at", String),
+    Column("time_to_detect_runs", Integer),
+    Column("time_to_resolve_runs", Integer),
+)
+
+incident_events_table = Table(
+    "incident_events",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "incident_id",
+        Integer,
+        ForeignKey("incidents.id"),
+        nullable=False,
+        index=True,
+    ),
+    Column("event_type", String, nullable=False),
+    Column("old_status", String),
+    Column("new_status", String),
+    Column("data", String),
+    Column("created_at", String, server_default=func.now()),
+)
+
+users_table = Table(
+    "users",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("email", String, unique=True, nullable=False),
+    Column("password_hash", String, nullable=False),
+    Column("name", String),
+    Column("stripe_customer_id", String),
+    Column("plan", String, server_default="free"),
+    Column("created_at", String, server_default=func.now()),
+    Column("email_verified", Boolean, server_default=sa_false()),
+)
+
+api_keys_table = Table(
+    "api_keys",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, ForeignKey("users.id"), nullable=False, index=True),
+    Column("key_hash", String, nullable=False, index=True),
+    Column("key_prefix", String, nullable=False),
+    Column("name", String),
+    Column("last_used_at", String),
+    Column("created_at", String, server_default=func.now()),
+    Column("revoked_at", String),
+)
+
+# ---------------------------------------------------------------------------
+# SQLAlchemy engine helpers
+# ---------------------------------------------------------------------------
+
+
+def get_engine(db_url=None):
+    """Create SA engine. DATABASE_URL -> PostgreSQL, else -> SQLite."""
+    if db_url is None:
+        db_url = os.environ.get("DATABASE_URL")
+    if db_url and db_url.startswith("postgres"):
+        # Railway uses postgres:// but SA needs postgresql://
+        if db_url.startswith("postgres://"):
+            db_url = db_url.replace("postgres://", "postgresql://", 1)
+        return create_engine(db_url)
+    else:
+        db_path = _resolve_db_path() if db_url is None else db_url
+        return create_engine(f"sqlite:///{db_path}")
+
+
+def init_db(engine=None):
+    """Create all tables via SA. Safe to call multiple times."""
+    if engine is None:
+        engine = get_engine()
+    metadata.create_all(engine)
+    return engine
+
+
+def get_sa_connection(engine=None):
+    """Get a SQLAlchemy connection."""
+    if engine is None:
+        engine = get_engine()
+    return engine.connect()
+
+
+# ---------------------------------------------------------------------------
+# Legacy SQLite schema + raw-SQL functions (unchanged — will migrate in Phase 2+)
+# ---------------------------------------------------------------------------
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,

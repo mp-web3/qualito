@@ -20,6 +20,7 @@ classifiers = [
 ]
 dependencies = [
     "click>=8.1,<8.3.2",
+    "sqlalchemy>=2.0",
 ]
 
 [project.urls]
@@ -32,6 +33,9 @@ mcp = [
     "mcp>=1.0,<1.27",
     "uvicorn>=0.31,<0.43",
 ]
+postgres = [
+    "psycopg2-binary>=2.9",
+]
 dashboard = [
     "fastapi>=0.115,<0.135.3",
     "uvicorn>=0.31,<0.43",
@@ -41,6 +45,7 @@ dashboard = [
     "stripe>=7.0,<15.0.1",
     "charset-normalizer>=3.0,<3.4.7",
     "email-validator>=2.0",
+    "psycopg2-binary>=2.9",
 ]
 all = [
     "qualito[mcp]",

@@ -4,10 +4,13 @@ from qualito.core.benchmark import compare_experiments, define_suite, run_experi
 from qualito.core.db import (
     get_artifacts,
     get_db,
+    get_engine,
     get_incident,
     get_incidents,
     get_metrics,
     get_run,
+    get_sa_connection,
+    init_db,
     insert_artifact,
     insert_evaluation,
     insert_file_activity,
@@ -15,6 +18,7 @@ from qualito.core.db import (
     insert_incident_event,
     insert_run,
     insert_tool_calls,
+    metadata,
     update_incident,
     update_run,
 )
@@ -33,6 +37,10 @@ from qualito.core.stream_parser import FileActivity, ParsedStream, ToolCall, par
 __all__ = [
     # db
     "get_db",
+    "get_engine",
+    "get_sa_connection",
+    "init_db",
+    "metadata",
     "get_artifacts",
     "get_incident",
     "get_incidents",
