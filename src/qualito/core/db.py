@@ -256,6 +256,8 @@ users_table = Table(
     Column("plan", String, server_default="free"),
     Column("created_at", String, server_default=func.now()),
     Column("email_verified", Boolean, server_default=sa_false()),
+    Column("role", String, server_default="user"),
+    Column("suspended", Boolean, server_default=sa_false()),
     Column("stripe_subscription_id", String),
     Column("marketing_consent", Boolean, server_default=sa_false()),
     Column("marketing_consent_date", String),

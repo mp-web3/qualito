@@ -133,7 +133,7 @@ def test_users_table_columns():
     cols = {c.name for c in metadata.tables["users"].columns}
     expected = {
         "id", "email", "password_hash", "name", "stripe_customer_id",
-        "plan", "created_at", "email_verified",
+        "plan", "created_at", "email_verified", "role", "suspended",
         "stripe_subscription_id", "marketing_consent", "marketing_consent_date",
     }
     assert cols == expected
