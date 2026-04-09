@@ -109,6 +109,7 @@ def test_runs_table_columns():
         "prompt", "original_prompt", "started_at", "completed_at",
         "researcher_summary", "implementer_summary", "verifier_verdict",
         "paper_live_gap", "skill_name", "source", "prompt_components",
+        "user_id",
     }
     assert cols == expected
 

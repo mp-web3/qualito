@@ -61,6 +61,7 @@ runs_table = Table(
     Column("skill_name", String),
     Column("source", String, server_default="delegation"),
     Column("prompt_components", String),
+    Column("user_id", Integer, ForeignKey("users.id"), index=True),
 )
 
 tool_calls_table = Table(
