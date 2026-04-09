@@ -6,8 +6,8 @@ from pathlib import Path
 
 def test_import_db():
     from qualito.core import db
-    assert hasattr(db, "get_db")
-    assert hasattr(db, "SCHEMA")
+    assert hasattr(db, "get_engine")
+    assert hasattr(db, "get_sa_connection")
 
 
 def test_import_dqi():
@@ -60,7 +60,7 @@ def test_import_core_package():
     from qualito.core import (
         calculate_dqi, store_dqi, auto_evaluate, human_score,
         parse_stream, ParsedStream, ToolCall, FileActivity,
-        get_db, get_run, get_metrics, insert_run, update_run,
+        get_engine, get_run, get_metrics, insert_run, update_run,
         take_baseline, evaluate_change, monitor,
         define_suite, run_experiment, compare_experiments,
         detect_patterns, normalize_task,
@@ -119,19 +119,20 @@ def test_normalize_task():
     assert normalize_task(long_task) == "one two three four five six seven eight"
 
 
-def test_get_db_creates_file(tmp_path):
-    """Test get_db creates a DB file in the specified directory."""
-    from qualito.core.db import get_db
+def test_get_engine_creates_file(tmp_path):
+    """Test get_engine + init_db creates a DB file with all tables."""
+    from qualito.core.db import get_engine, get_sa_connection, init_db
 
     db_path = tmp_path / "test.db"
-    conn = get_db(db_path=db_path)
+    engine = get_engine(str(db_path))
+    init_db(engine)
     assert db_path.exists()
 
-    # Verify schema was created
-    tables = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-    ).fetchall()
-    table_names = {r["name"] for r in tables}
+    conn = get_sa_connection(engine)
+    # Verify tables via SA inspection
+    from sqlalchemy import inspect
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
     assert "runs" in table_names
     assert "evaluations" in table_names
     assert "tool_calls" in table_names
@@ -157,36 +158,35 @@ def test_import_incident_detector():
 
 def test_incidents_table_exists(tmp_path):
     """Verify incidents and incident_events tables are in the schema."""
-    from qualito.core.db import get_db
+    from qualito.core.db import get_engine, init_db
 
     db_path = tmp_path / "test.db"
-    conn = get_db(db_path=db_path)
+    engine = get_engine(str(db_path))
+    init_db(engine)
 
-    tables = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-    ).fetchall()
-    table_names = {r["name"] for r in tables}
+    from sqlalchemy import inspect
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
     assert "incidents" in table_names
     assert "incident_events" in table_names
 
     # Verify key columns exist
-    cols = conn.execute("PRAGMA table_info(incidents)").fetchall()
-    col_names = {c["name"] for c in cols}
-    assert "incident_key" in col_names
-    assert "severity" in col_names
-    assert "workspace" in col_names
-    assert "detection_method" in col_names
-
-    conn.close()
+    columns = {c["name"] for c in inspector.get_columns("incidents")}
+    assert "incident_key" in columns
+    assert "severity" in columns
+    assert "workspace" in columns
+    assert "detection_method" in columns
 
 
 def test_check_run_with_no_data(tmp_path):
     """Call check_run with empty DB — should return empty list, not crash."""
-    from qualito.core.db import get_db
+    from qualito.core.db import get_engine, get_sa_connection, init_db
     from qualito.core.incident_detector import check_run
 
     db_path = tmp_path / "test.db"
-    conn = get_db(db_path=db_path)
+    engine = get_engine(str(db_path))
+    init_db(engine)
+    conn = get_sa_connection(engine)
 
     # Non-existent run_id
     results = check_run(conn, "nonexistent-run-id")

@@ -60,6 +60,7 @@ dev = [
 [project.scripts]
 qualito = "qualito.cli.main:cli"
 qualito-mcp = "qualito.mcp.server:main"
+qualito-migrate = "qualito.cli.migrate:main"
 
 [build-system]
 requires = ["hatchling"]

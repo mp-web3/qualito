@@ -8,7 +8,6 @@ import json
 import math
 import random
 import re
-import sqlite3
 import subprocess
 import sys
 import time
@@ -23,7 +22,6 @@ from qualito.core.db import (
     evaluations_table,
     experiment_comparisons_table,
     experiments_table,
-    get_db as _get_db,
     get_sa_connection,
     runs_table,
 )
@@ -117,9 +115,6 @@ def define_suite(name: str, tasks: list[dict], description: str = "", conn=None)
         description: Optional description.
         conn: Optional DB connection. If None, opens and closes its own.
     """
-    if isinstance(conn, sqlite3.Connection):
-        return define_suite_legacy(name, tasks, description=description, conn=conn)
-
     owns_conn = conn is None
     if owns_conn:
         conn = get_sa_connection()
@@ -159,12 +154,6 @@ def run_experiment(name: str, suite_name: str = "v1", description: str = "",
         delegate_command: Command to use for delegation (default: 'dqi delegate').
         conn: Optional DB connection. If None, opens and closes its own.
     """
-    if isinstance(conn, sqlite3.Connection):
-        return run_experiment_legacy(
-            name, suite_name=suite_name, description=description,
-            delegate_command=delegate_command, conn=conn,
-        )
-
     owns_conn = conn is None
     if owns_conn:
         conn = get_sa_connection()
@@ -291,9 +280,6 @@ def compare_experiments(before_name: str, after_name: str, conn=None):
         after_name: Name of the comparison experiment.
         conn: Optional DB connection. If None, opens and closes its own.
     """
-    if isinstance(conn, sqlite3.Connection):
-        return compare_experiments_legacy(before_name, after_name, conn=conn)
-
     owns_conn = conn is None
     if owns_conn:
         conn = get_sa_connection()
@@ -401,9 +387,6 @@ def show_status(conn=None):
     Args:
         conn: Optional DB connection. If None, opens and closes its own.
     """
-    if isinstance(conn, sqlite3.Connection):
-        return show_status_legacy(conn=conn)
-
     owns_conn = conn is None
     if owns_conn:
         conn = get_sa_connection()
@@ -481,18 +464,13 @@ def _poll_until_complete(conn, run_ids: list[dict], timeout: int = 600):
     if not valid_ids:
         return
 
-    is_sa = not isinstance(conn, sqlite3.Connection)
-
     start = time.time()
     while time.time() - start < timeout:
         pending = []
         for rid in valid_ids:
-            if is_sa:
-                row = conn.execute(
-                    select(runs_table.c.status).where(runs_table.c.id == rid)
-                ).mappings().fetchone()
-            else:
-                row = conn.execute("SELECT status FROM runs WHERE id = ?", (rid,)).fetchone()
+            row = conn.execute(
+                select(runs_table.c.status).where(runs_table.c.id == rid)
+            ).mappings().fetchone()
             if not row or row["status"] in ("running", None, ""):
                 pending.append(rid)
 
@@ -512,8 +490,6 @@ def _compute_experiment_dqi(conn, run_ids: list[dict]) -> tuple[dict, float]:
     per_task = {}
     scores = []
 
-    is_sa = not isinstance(conn, sqlite3.Connection)
-
     for item in run_ids:
         rid = item.get("run_id")
         label = item["label"]
@@ -522,21 +498,15 @@ def _compute_experiment_dqi(conn, run_ids: list[dict]) -> tuple[dict, float]:
             scores.append(0.0)
             continue
 
-        if is_sa:
-            row = conn.execute(
-                select(evaluations_table.c.score)
-                .where(
-                    and_(
-                        evaluations_table.c.run_id == rid,
-                        evaluations_table.c.eval_type == "dqi",
-                    )
+        row = conn.execute(
+            select(evaluations_table.c.score)
+            .where(
+                and_(
+                    evaluations_table.c.run_id == rid,
+                    evaluations_table.c.eval_type == "dqi",
                 )
-            ).mappings().fetchone()
-        else:
-            row = conn.execute(
-                "SELECT score FROM evaluations WHERE run_id = ? AND eval_type = 'dqi'",
-                (rid,),
-            ).fetchone()
+            )
+        ).mappings().fetchone()
 
         dqi = row["score"] if row and row["score"] is not None else 0.0
         per_task[label] = round(dqi, 4)
@@ -559,259 +529,3 @@ def _print_experiment_report(name: str, per_task: dict, avg: float):
     print(f"{'-' * 30}")
     print(f"{'AVERAGE':<20} {avg:>7.3f}")
     print(f"{'=' * 50}")
-
-
-# ---------------------------------------------------------------------------
-# Legacy raw-SQL functions (renamed with _legacy suffix)
-# ---------------------------------------------------------------------------
-
-
-def define_suite_legacy(name: str, tasks: list[dict], description: str = "", conn=None):
-    """Legacy: Register a benchmark suite using raw SQL."""
-    owns_conn = conn is None
-    if owns_conn:
-        conn = _get_db()
-
-    existing = conn.execute("SELECT id FROM benchmark_suites WHERE name = ?", (name,)).fetchone()
-    if existing:
-        print(f"Suite '{name}' already exists (id={existing['id']})")
-        if owns_conn:
-            conn.close()
-        return
-
-    conn.execute(
-        "INSERT INTO benchmark_suites (name, description, tasks) VALUES (?, ?, ?)",
-        (name, description or f"Benchmark suite {name}", json.dumps(tasks)),
-    )
-    conn.commit()
-    if owns_conn:
-        conn.close()
-    print(f"Defined suite '{name}' with {len(tasks)} tasks")
-
-
-def run_experiment_legacy(name: str, suite_name: str = "v1", description: str = "",
-                          delegate_command: str = "qualito delegate", conn=None):
-    """Legacy: Run a benchmark experiment using raw SQL."""
-    owns_conn = conn is None
-    if owns_conn:
-        conn = _get_db()
-
-    existing = conn.execute("SELECT id FROM experiments WHERE name = ?", (name,)).fetchone()
-    if existing:
-        print(f"Error: experiment '{name}' already exists")
-        if owns_conn:
-            conn.close()
-        return
-
-    suite = conn.execute("SELECT * FROM benchmark_suites WHERE name = ?", (suite_name,)).fetchone()
-    if not suite:
-        print(f"Error: suite '{suite_name}' not found. Define it first.")
-        if owns_conn:
-            conn.close()
-        return
-
-    tasks = json.loads(suite["tasks"])
-
-    conn.execute(
-        """INSERT INTO experiments (name, description, suite_id, status, config_snapshot)
-           VALUES (?, ?, ?, 'running', ?)""",
-        (name, description, suite["id"],
-         json.dumps({"suite": suite_name, "timestamp": datetime.now(timezone.utc).isoformat()})),
-    )
-    conn.commit()
-
-    print(f"\n=== Running experiment: {name} ({len(tasks)} tasks) ===\n")
-
-    cmd_parts = delegate_command.split()
-    run_ids = []
-    for i, task_def in enumerate(tasks):
-        if i > 0:
-            time.sleep(3)
-
-        args = cmd_parts + [
-            "--workspace", task_def["workspace"],
-            "--skill", "benchmark",
-            "--task", task_def["task"],
-        ]
-        if task_def.get("pipeline_mode") == "research-only":
-            args.append("--research-only")
-
-        try:
-            launch_timeout = 600 if task_def.get("pipeline_mode") == "research-only" else 30
-            result = subprocess.run(args, capture_output=True, text=True, timeout=launch_timeout)
-            run_id = _parse_run_id(result.stdout)
-            if run_id:
-                run_ids.append({"label": task_def["label"], "run_id": run_id})
-                print(f"  [{i+1}/{len(tasks)}] {task_def['label']:20} -> {run_id}")
-            else:
-                print(f"  [{i+1}/{len(tasks)}] {task_def['label']:20} -> FAILED TO LAUNCH")
-                print(f"    stdout: {result.stdout[:200]}")
-                print(f"    stderr: {result.stderr[:200]}")
-                run_ids.append({"label": task_def["label"], "run_id": None, "error": "launch failed"})
-        except Exception as e:
-            print(f"  [{i+1}/{len(tasks)}] {task_def['label']:20} -> ERROR: {e}")
-            run_ids.append({"label": task_def["label"], "run_id": None, "error": str(e)})
-
-    conn.execute("UPDATE experiments SET run_ids = ? WHERE name = ?", (json.dumps(run_ids), name))
-    conn.commit()
-
-    print(f"\nPolling for completion (timeout: 10 min)...")
-    _poll_until_complete(conn, run_ids, timeout=600)
-
-    for item in run_ids:
-        if item.get("run_id"):
-            try:
-                store_dqi(item["run_id"], conn=conn)
-            except Exception:
-                pass
-
-    per_task, avg = _compute_experiment_dqi(conn, run_ids)
-
-    conn.execute(
-        """UPDATE experiments SET status = 'completed', avg_dqi = ?, per_task_dqi = ?,
-           completed_at = datetime('now') WHERE name = ?""",
-        (avg, json.dumps(per_task), name),
-    )
-    conn.commit()
-
-    if owns_conn:
-        conn.close()
-
-    _print_experiment_report(name, per_task, avg)
-
-
-def compare_experiments_legacy(before_name: str, after_name: str, conn=None):
-    """Legacy: Compare two experiments using raw SQL."""
-    owns_conn = conn is None
-    if owns_conn:
-        conn = _get_db()
-
-    before = conn.execute("SELECT * FROM experiments WHERE name = ?", (before_name,)).fetchone()
-    after = conn.execute("SELECT * FROM experiments WHERE name = ?", (after_name,)).fetchone()
-
-    if not before or not after:
-        print(f"Error: experiment not found. "
-              f"{before_name}={'found' if before else 'missing'}, "
-              f"{after_name}={'found' if after else 'missing'}")
-        if owns_conn:
-            conn.close()
-        return
-
-    if before["status"] != "completed" or after["status"] != "completed":
-        print("Error: both experiments must be completed before comparing.")
-        if owns_conn:
-            conn.close()
-        return
-
-    before_tasks = json.loads(before["per_task_dqi"])
-    after_tasks = json.loads(after["per_task_dqi"])
-
-    labels = sorted(set(before_tasks.keys()) & set(after_tasks.keys()))
-    if not labels:
-        print("Error: no overlapping task labels between experiments.")
-        if owns_conn:
-            conn.close()
-        return
-
-    before_scores = [before_tasks[l] for l in labels]
-    after_scores = [after_tasks[l] for l in labels]
-
-    wilcoxon_p = _wilcoxon_signed_rank(before_scores, after_scores)
-    after_wins = sum(1 for a, b in zip(after_scores, before_scores) if a > b)
-    bayesian_p = _bayesian_p_improvement(after_wins, len(labels))
-    diffs = [a - b for a, b in zip(after_scores, before_scores)]
-    effect = mean(diffs)
-
-    per_task_delta = {}
-    for label in labels:
-        b, a = before_tasks[label], after_tasks[label]
-        per_task_delta[label] = {"before": round(b, 4), "after": round(a, 4), "delta": round(a - b, 4)}
-
-    if bayesian_p > 0.90 and effect > 0:
-        verdict = "improved"
-    elif bayesian_p < 0.10 and effect < 0:
-        verdict = "degraded"
-    else:
-        verdict = "inconclusive"
-
-    comp_name = f"{before_name}_vs_{after_name}"
-    conn.execute(
-        """INSERT INTO experiment_comparisons
-           (name, before_experiment_id, after_experiment_id, per_task_delta,
-            wilcoxon_p, bayesian_p_improvement, effect_size, verdict)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (comp_name, before["id"], after["id"], json.dumps(per_task_delta),
-         round(wilcoxon_p, 4), round(bayesian_p, 4), round(effect, 4), verdict),
-    )
-    conn.commit()
-
-    if owns_conn:
-        conn.close()
-
-    print(f"\n{'=' * 60}")
-    print(f"  Comparison: {before_name} vs {after_name}")
-    print(f"{'=' * 60}")
-    print(f"\n{'Task':<20} {'Before':>8} {'After':>8} {'Delta':>8}")
-    print(f"{'-' * 48}")
-    for label in labels:
-        d = per_task_delta[label]
-        sign = "+" if d["delta"] > 0 else ""
-        print(f"{label:<20} {d['before']:>8.3f} {d['after']:>8.3f} {sign}{d['delta']:>7.4f}")
-    print(f"{'-' * 48}")
-    sign = "+" if effect > 0 else ""
-    print(f"{'AVERAGE':<20} {before['avg_dqi']:>8.3f} {after['avg_dqi']:>8.3f} {sign}{effect:>7.4f}")
-    print(f"\n  Wilcoxon p-value:      {wilcoxon_p:.4f}")
-    print(f"  P(improvement):        {bayesian_p:.3f}")
-    print(f"  Effect size:           {sign}{effect:.4f}")
-    print(f"  Verdict:               {verdict.upper()}")
-    print(f"{'=' * 60}")
-
-
-def show_status_legacy(conn=None):
-    """Legacy: Show all suites, experiments, and comparisons using raw SQL."""
-    owns_conn = conn is None
-    if owns_conn:
-        conn = _get_db()
-
-    suites = conn.execute("SELECT * FROM benchmark_suites ORDER BY created_at").fetchall()
-    experiments = conn.execute("SELECT * FROM experiments ORDER BY created_at").fetchall()
-    comparisons = conn.execute("""
-        SELECT c.*, b.name as before_name, a.name as after_name
-        FROM experiment_comparisons c
-        JOIN experiments b ON b.id = c.before_experiment_id
-        JOIN experiments a ON a.id = c.after_experiment_id
-        ORDER BY c.created_at
-    """).fetchall()
-
-    if owns_conn:
-        conn.close()
-
-    print(f"\n{'=' * 70}")
-    print(f"  Benchmark Status")
-    print(f"{'=' * 70}")
-
-    print(f"\n  Suites ({len(suites)})")
-    print(f"  {'-' * 60}")
-    for s in suites:
-        tasks = json.loads(s["tasks"])
-        print(f"  {s['name']:20} {len(tasks)} tasks    {s['created_at'][:10]}")
-
-    print(f"\n  Experiments ({len(experiments)})")
-    print(f"  {'-' * 60}")
-    for e in experiments:
-        run_ids = json.loads(e["run_ids"]) if e["run_ids"] else []
-        completed = sum(1 for r in run_ids if r.get("run_id"))
-        dqi_str = f"DQI={e['avg_dqi']:.3f}" if e["avg_dqi"] else "DQI=-"
-        print(f"  {e['name']:25} {e['status']:12} {dqi_str:12} {completed}/{len(run_ids)} tasks   {e['created_at'][:10]}")
-
-    if comparisons:
-        print(f"\n  Comparisons ({len(comparisons)})")
-        print(f"  {'-' * 60}")
-        for c in comparisons:
-            p = f"P={c['bayesian_p_improvement']:.2f}" if c["bayesian_p_improvement"] is not None else "P=-"
-            eff = f"delta={c['effect_size']:+.3f}" if c["effect_size"] is not None else "delta=-"
-            verdict = (c["verdict"] or "-").upper()
-            print(f"  {c['before_name']} vs {c['after_name']}")
-            print(f"    {p:12} {eff:16} {verdict}")
-
-    print(f"\n{'=' * 70}")

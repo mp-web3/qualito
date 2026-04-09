@@ -3,7 +3,6 @@
 from qualito.core.benchmark import compare_experiments, define_suite, run_experiment
 from qualito.core.db import (
     get_artifacts,
-    get_db,
     get_engine,
     get_incident,
     get_incidents,
@@ -36,7 +35,6 @@ from qualito.core.stream_parser import FileActivity, ParsedStream, ToolCall, par
 
 __all__ = [
     # db
-    "get_db",
     "get_engine",
     "get_sa_connection",
     "init_db",

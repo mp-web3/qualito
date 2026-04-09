@@ -188,12 +188,12 @@ def init_project(project_dir: Path | None = None, *, local: bool = False) -> tup
     config = load_config(project_dir)
 
     # Create database
-    from qualito.core.db import get_db
+    from qualito.core.db import get_engine, init_db
 
     db_path = config.db_path
     if not db_path.is_absolute():
         db_path = project_dir / db_path
-    conn = get_db(db_path=db_path)
-    conn.close()
+    engine = get_engine(str(db_path))
+    init_db(engine)
 
     return config, qualito_dir

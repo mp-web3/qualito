@@ -8,7 +8,9 @@ import json
 from datetime import date
 from pathlib import Path
 
-from qualito.core.db import get_db as _get_db
+from sqlalchemy import and_, case, func, select
+
+from qualito.core.db import evaluations_table, get_sa_connection, runs_table
 
 # Map failing auto-eval checks to actionable suggestions
 CHECK_SUGGESTIONS = {
@@ -26,36 +28,52 @@ CHECK_SUGGESTIONS = {
 def get_flagged_combos(conn, threshold: float, min_runs: int,
                        workspace: str | None = None) -> list[dict]:
     """Find workspace/task_type combos with avg DQI below threshold."""
-    params: list = []
-    ws_filter = ""
-    if workspace:
-        ws_filter = "AND r.workspace = ?"
-        params.append(workspace)
-    params.extend([min_runs, threshold])
+    r = runs_table
+    e = evaluations_table
 
-    rows = conn.execute(f"""
-        SELECT r.workspace, r.task_type, COUNT(*) as cnt,
-               AVG(e.score) as avg_dqi,
-               SUM(CASE WHEN e.score < 0.70 THEN 1 ELSE 0 END) as low_count
-        FROM runs r
-        JOIN evaluations e ON e.run_id = r.id AND e.eval_type = 'dqi'
-        WHERE r.status = 'completed' AND r.source = 'delegation'
-              {ws_filter}
-        GROUP BY r.workspace, r.task_type
-        HAVING COUNT(*) >= ? AND AVG(e.score) < ?
-    """, params).fetchall()
-    return [dict(r) for r in rows]
+    conditions = [
+        r.c.status == "completed",
+        r.c.source == "delegation",
+        e.c.eval_type == "dqi",
+    ]
+    if workspace:
+        conditions.append(r.c.workspace == workspace)
+
+    stmt = (
+        select(
+            r.c.workspace,
+            r.c.task_type,
+            func.count().label("cnt"),
+            func.avg(e.c.score).label("avg_dqi"),
+            func.sum(case((e.c.score < 0.70, 1), else_=0)).label("low_count"),
+        )
+        .select_from(r.join(e, and_(e.c.run_id == r.c.id, e.c.eval_type == "dqi")))
+        .where(and_(r.c.status == "completed", r.c.source == "delegation",
+                     *([r.c.workspace == workspace] if workspace else [])))
+        .group_by(r.c.workspace, r.c.task_type)
+        .having(and_(func.count() >= min_runs, func.avg(e.c.score) < threshold))
+    )
+    rows = conn.execute(stmt).mappings().fetchall()
+    return [dict(row) for row in rows]
 
 
 def analyze_failure_patterns(conn, workspace: str, task_type: str) -> dict:
     """Analyze which auto-eval checks fail most often for a combo."""
-    rows = conn.execute("""
-        SELECT e.checks
-        FROM evaluations e
-        JOIN runs r ON r.id = e.run_id
-        WHERE r.workspace = ? AND r.task_type = ? AND e.eval_type = 'auto'
-              AND r.status = 'completed' AND r.source = 'delegation'
-    """, (workspace, task_type)).fetchall()
+    r = runs_table
+    e = evaluations_table
+    rows = conn.execute(
+        select(e.c.checks)
+        .select_from(e.join(r, r.c.id == e.c.run_id))
+        .where(
+            and_(
+                r.c.workspace == workspace,
+                r.c.task_type == task_type,
+                e.c.eval_type == "auto",
+                r.c.status == "completed",
+                r.c.source == "delegation",
+            )
+        )
+    ).mappings().fetchall()
 
     if not rows:
         return {"top_check": None, "top_pct": 0, "total_evals": 0}
@@ -92,15 +110,23 @@ def analyze_failure_patterns(conn, workspace: str, task_type: str) -> dict:
 
 def analyze_cost_gap(conn, workspace: str, task_type: str) -> dict:
     """Compare avg cost of low-DQI runs vs high-DQI runs."""
-    row = conn.execute("""
-        SELECT
-            AVG(CASE WHEN e.score < 0.70 THEN r.cost_usd END) as avg_cost_low,
-            AVG(CASE WHEN e.score >= 0.70 THEN r.cost_usd END) as avg_cost_high
-        FROM runs r
-        JOIN evaluations e ON e.run_id = r.id AND e.eval_type = 'dqi'
-        WHERE r.workspace = ? AND r.task_type = ?
-              AND r.status = 'completed' AND r.source = 'delegation'
-    """, (workspace, task_type)).fetchone()
+    r = runs_table
+    e = evaluations_table
+    row = conn.execute(
+        select(
+            func.avg(case((e.c.score < 0.70, r.c.cost_usd))).label("avg_cost_low"),
+            func.avg(case((e.c.score >= 0.70, r.c.cost_usd))).label("avg_cost_high"),
+        )
+        .select_from(r.join(e, and_(e.c.run_id == r.c.id, e.c.eval_type == "dqi")))
+        .where(
+            and_(
+                r.c.workspace == workspace,
+                r.c.task_type == task_type,
+                r.c.status == "completed",
+                r.c.source == "delegation",
+            )
+        )
+    ).mappings().fetchone()
 
     return {
         "avg_cost_low": row["avg_cost_low"],
@@ -156,7 +182,7 @@ def run_feedback_loop(threshold: float = 0.75, min_runs: int = 5,
     """
     owns_conn = conn is None
     if owns_conn:
-        conn = _get_db()
+        conn = get_sa_connection()
 
     combos = get_flagged_combos(conn, threshold, min_runs, workspace)
 

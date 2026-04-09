@@ -104,38 +104,39 @@ def detect_patterns(
         workspace: Optional workspace filter.
         conn: Optional DB connection. If None, opens and closes its own.
     """
+    from sqlalchemy import and_, outerjoin, select
+
+    from qualito.core.db import evaluations_table, get_sa_connection, runs_table
+
     owns_conn = conn is None
     if owns_conn:
-        from qualito.core.db import get_db
-        conn = get_db()
+        conn = get_sa_connection()
 
     since_date = (datetime.now() - timedelta(days=since_days)).strftime("%Y-%m-%d")
 
-    # Build query for completed delegation runs
-    where_parts = [
-        "r.status = 'completed'",
-        "r.source = 'delegation'",
-        "r.started_at >= ?",
+    r = runs_table
+    e = evaluations_table
+
+    conditions = [
+        r.c.status == "completed",
+        r.c.source == "delegation",
+        r.c.started_at >= since_date,
     ]
-    params: list = [since_date]
-
     if workspace:
-        where_parts.append("r.workspace = ?")
-        params.append(workspace)
-
-    where = " AND ".join(where_parts)
+        conditions.append(r.c.workspace == workspace)
 
     rows = conn.execute(
-        f"""
-        SELECT r.id, r.task, r.cost_usd, r.task_type, r.workspace, r.skill_name,
-               e.score AS dqi_score
-        FROM runs r
-        LEFT JOIN evaluations e ON e.run_id = r.id AND e.eval_type = 'dqi'
-        WHERE {where}
-        ORDER BY r.started_at DESC
-        """,
-        params,
-    ).fetchall()
+        select(
+            r.c.id, r.c.task, r.c.cost_usd, r.c.task_type,
+            r.c.workspace, r.c.skill_name,
+            e.c.score.label("dqi_score"),
+        )
+        .select_from(
+            r.outerjoin(e, and_(e.c.run_id == r.c.id, e.c.eval_type == "dqi"))
+        )
+        .where(and_(*conditions))
+        .order_by(r.c.started_at.desc())
+    ).mappings().fetchall()
 
     if owns_conn:
         conn.close()

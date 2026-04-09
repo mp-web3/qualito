@@ -152,8 +152,8 @@ def store_dqi(run_id: str, conn=None) -> dict:
     """
     owns_conn = conn is None
     if owns_conn:
-        from qualito.core.db import get_db
-        conn = get_db()
+        from qualito.core.db import get_sa_connection
+        conn = get_sa_connection()
 
     run = get_run(conn, run_id)
     if not run:
