@@ -48,6 +48,7 @@ dashboard = [
     "psycopg2-binary>=2.9",
     "slowapi>=0.1.9",
     "resend>=2.0",
+    "mcp>=1.0,<1.27",
 ]
 all = [
     "qualito[mcp]",
