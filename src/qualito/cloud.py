@@ -18,7 +18,7 @@ from qualito.core.db import (
     runs_table,
 )
 
-DEFAULT_API_URL = "https://api.qualito.dev"
+DEFAULT_API_URL = "https://api.qualito.ai"
 CREDENTIALS_PATH = Path.home() / ".qualito" / "credentials.json"
 
 

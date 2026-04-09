@@ -256,6 +256,9 @@ users_table = Table(
     Column("plan", String, server_default="free"),
     Column("created_at", String, server_default=func.now()),
     Column("email_verified", Boolean, server_default=sa_false()),
+    Column("stripe_subscription_id", String),
+    Column("marketing_consent", Boolean, server_default=sa_false()),
+    Column("marketing_consent_date", String),
 )
 
 api_keys_table = Table(
@@ -269,6 +272,52 @@ api_keys_table = Table(
     Column("last_used_at", String),
     Column("created_at", String, server_default=func.now()),
     Column("revoked_at", String),
+)
+
+processed_events_table = Table(
+    "processed_events",
+    metadata,
+    Column("event_id", String, primary_key=True),
+    Column("event_type", String, nullable=False),
+    Column("processed_at", String, server_default=func.now()),
+)
+
+consent_table = Table(
+    "consent",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, ForeignKey("users.id"), nullable=False, index=True),
+    Column("tos_accepted", Boolean, server_default=sa_false()),
+    Column("privacy_accepted", Boolean, server_default=sa_false()),
+    Column("marketing_opt_in", Boolean, server_default=sa_false()),
+    Column("tos_version", String, server_default="v1.0"),
+    Column("privacy_version", String, server_default="v1.0"),
+    Column("ip_address", String),
+    Column("user_agent", String),
+    Column("created_at", String, server_default=func.now()),
+)
+
+email_logs_table = Table(
+    "email_logs",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("email_type", String, nullable=False),
+    Column("recipient_email", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("provider_id", String),
+    Column("error_message", String),
+    Column("sent_at", String, server_default=func.now()),
+)
+
+setup_tokens_table = Table(
+    "setup_tokens",
+    metadata,
+    Column("token", String, primary_key=True),
+    Column("user_id", Integer, ForeignKey("users.id"), nullable=False),
+    Column("email", String, nullable=False),
+    Column("created_at", String, server_default=func.now()),
+    Column("expires_at", String, nullable=False),
+    Column("used", Boolean, server_default=sa_false()),
 )
 
 # ---------------------------------------------------------------------------

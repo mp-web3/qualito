@@ -1,10 +1,8 @@
 """Tests for SQLAlchemy table definitions and engine setup."""
 
-import pytest
 from sqlalchemy import inspect
 
 from qualito.core.db import get_engine, init_db, metadata
-
 
 EXPECTED_TABLES = {
     "runs",
@@ -21,12 +19,16 @@ EXPECTED_TABLES = {
     "incident_events",
     "users",
     "api_keys",
+    "processed_events",
+    "consent",
+    "email_logs",
+    "setup_tokens",
 }
 
 
-def test_metadata_has_14_tables():
-    """metadata.tables has exactly 14 entries with correct names."""
-    assert len(metadata.tables) == 14
+def test_metadata_has_18_tables():
+    """metadata.tables has exactly 18 entries with correct names."""
+    assert len(metadata.tables) == 18
     assert set(metadata.tables.keys()) == EXPECTED_TABLES
 
 
@@ -68,7 +70,7 @@ def test_get_engine_explicit_path(tmp_path):
 
 
 def test_init_db_creates_all_tables(tmp_path):
-    """init_db creates all 14 tables in a fresh SQLite database."""
+    """init_db creates all 18 tables in a fresh SQLite database."""
     db_file = str(tmp_path / "test.db")
     engine = get_engine(db_file)
     init_db(engine)
@@ -86,7 +88,7 @@ def test_init_db_idempotent(tmp_path):
     init_db(engine)  # Should not raise
 
     insp = inspect(engine)
-    assert len(insp.get_table_names()) == 14
+    assert len(insp.get_table_names()) == 18
 
 
 def test_init_db_returns_engine(tmp_path):
@@ -132,6 +134,7 @@ def test_users_table_columns():
     expected = {
         "id", "email", "password_hash", "name", "stripe_customer_id",
         "plan", "created_at", "email_verified",
+        "stripe_subscription_id", "marketing_consent", "marketing_consent_date",
     }
     assert cols == expected
 

@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -195,6 +196,24 @@ def safe_add_mcp_to_claude_json() -> bool:
     return True
 
 
+def _is_uvx() -> bool:
+    """Check if running via uvx (temporary environment)."""
+    exe = sys.executable or ""
+    # uvx runs from a temp/cache directory, not a standard install path
+    return "uvx" in exe or "/tmp/" in exe or "/.cache/uv/" in exe
+
+
+def _print_next_steps():
+    """Print next steps after setup completes."""
+    prefix = "uvx qualito" if _is_uvx() else "qualito"
+    click.echo("\nNext steps:")
+    click.echo(f"  {prefix} login    # connect to cloud dashboard")
+    click.echo(f"  {prefix} sync     # push data to cloud")
+    if _is_uvx():
+        click.echo()
+        click.echo("Or install permanently: uv tool install qualito")
+
+
 def _display_results_table(summaries: list[dict]):
     """Display workspace results table."""
     if not summaries:
@@ -227,6 +246,23 @@ def _display_results_table(summaries: list[dict]):
 # ---------------------------------------------------------------------------
 # qualito setup
 # ---------------------------------------------------------------------------
+
+
+def _report_setup_progress(api_url: str, token: str, step: str, detail: str = ""):
+    """Report setup progress to the cloud API (best-effort)."""
+    import urllib.request
+
+    try:
+        data = json.dumps({"token": token, "step": step, "detail": detail}).encode()
+        req = urllib.request.Request(
+            f"{api_url}/api/setup/progress",
+            data=data,
+            method="POST",
+        )
+        req.add_header("Content-Type", "application/json")
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass  # Best-effort, don't fail setup
 
 
 def _run_interactive_setup_first_run():
@@ -320,6 +356,7 @@ def _run_interactive_setup_first_run():
         safe_add_mcp_to_claude_json()
 
     click.echo("\nSetup complete. Run 'qualito setup' anytime to add more projects.")
+    _print_next_steps()
 
 
 def _run_interactive_setup_rerun():
@@ -475,15 +512,13 @@ def _run_interactive_setup_rerun():
 def setup(token):
     """Set up Qualito — discover and import Claude Code sessions.
 
-    With TOKEN: cloud setup (coming soon, falls back to local import-all).
+    With TOKEN: import locally, validate with cloud, and auto-sync.
     Without TOKEN: interactive guided setup.
     """
     if token:
-        # Auto setup with token — cloud not built yet, run import-all
-        click.echo(
-            "Cloud setup will be available after deployment. "
-            "Running local setup...\n"
-        )
+        import urllib.error
+        import urllib.request
+
         from qualito.config import init_project
         from qualito.importer import discover_all_projects, import_project
 
@@ -500,9 +535,9 @@ def setup(token):
         click.echo(f"Found {len(projects)} project(s). Importing all...\n")
         engine = get_engine(str(db_path))
         conn = get_sa_connection(engine)
+        total_imported = 0
+        total_skipped = 0
         try:
-            total_imported = 0
-            total_skipped = 0
             for p in projects:
                 result = import_project(
                     project_key=p["folder"],
@@ -511,19 +546,85 @@ def setup(token):
                 )
                 total_imported += result["imported"]
                 total_skipped += result["skipped"]
-
-            click.echo(
-                f"Imported {total_imported} sessions, skipped {total_skipped}"
-            )
-            if total_imported > 0:
-                summaries = _get_workspace_summary(conn)
-                _display_results_table(summaries)
         finally:
             conn.close()
 
+        click.echo(f"Imported {total_imported} sessions locally.")
+
+        if total_imported > 0:
+            engine = get_engine(str(db_path))
+            summary_conn = get_sa_connection(engine)
+            try:
+                summaries = _get_workspace_summary(summary_conn)
+                _display_results_table(summaries)
+            finally:
+                summary_conn.close()
+
         # Auto-configure MCP
         safe_add_mcp_to_claude_json()
-        click.echo("\nSetup complete.")
+
+        # Attempt cloud validation + sync
+        from qualito.cloud import DEFAULT_API_URL
+
+        api_url = os.environ.get("QUALITO_API_URL", DEFAULT_API_URL)
+
+        click.echo("\nConnecting to cloud...")
+        try:
+            req_data = json.dumps({"token": token}).encode()
+            req = urllib.request.Request(
+                f"{api_url}/api/setup/validate",
+                data=req_data,
+                method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+            req.add_header("User-Agent", "qualito-cli")
+
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                validate_result = json.loads(resp.read().decode())
+
+            api_key = validate_result["api_key"]
+
+            # Save credentials
+            from qualito.cloud import save_credentials
+
+            save_credentials(api_key, api_url)
+
+            # Report progress (best-effort, updates dashboard SSE tracker)
+            _report_setup_progress(api_url, token, "connected")
+            _report_setup_progress(
+                api_url, token, "importing", f"{total_imported} sessions"
+            )
+            _report_setup_progress(api_url, token, "scoring")
+
+            # Attempt sync
+            if total_imported > 0:
+                click.echo("Syncing to cloud...")
+                from qualito.cloud import sync_incidents, sync_runs
+
+                engine = get_engine(str(db_path))
+                sync_conn = get_sa_connection(engine)
+                try:
+                    run_result = sync_runs(sync_conn)
+                    inc_result = sync_incidents(sync_conn)
+                    click.echo(
+                        f"Synced {run_result['synced']} runs to cloud."
+                    )
+                finally:
+                    sync_conn.close()
+
+            # Report complete (triggers dashboard reload via SSE)
+            _report_setup_progress(api_url, token, "complete")
+
+            click.echo(
+                "\nSynced to cloud. Open app.qualito.ai to see your dashboard."
+            )
+
+        except Exception:
+            click.echo(
+                "\nCould not connect to cloud. "
+                "Your data is imported locally."
+            )
+            _print_next_steps()
     else:
         # Interactive setup
         global_dir = Path.home() / ".qualito"
