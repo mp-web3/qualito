@@ -6,12 +6,19 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import click
+from sqlalchemy import and_, case, func, select
 
 from qualito import __version__
+from qualito.core.db import (
+    evaluations_table,
+    get_engine,
+    get_sa_connection,
+    runs_table,
+)
 
 
 def _get_conn(project_dir: Path | None = None):
-    """Resolve config and return a DB connection + config.
+    """Resolve config and return a SA connection + config.
 
     Checks for global ~/.qualito/ first, then local .qualito/ for backward compat.
     """
@@ -26,7 +33,6 @@ def _get_conn(project_dir: Path | None = None):
         raise SystemExit(1)
 
     from qualito.config import load_config
-    from qualito.core.db import get_db
 
     config = load_config(project_dir)
     db_path = config.db_path
@@ -37,7 +43,8 @@ def _get_conn(project_dir: Path | None = None):
         # Try creating the DB (first run after init)
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = get_db(db_path=db_path)
+    engine = get_engine(str(db_path))
+    conn = get_sa_connection(engine)
     return conn, config
 
 
@@ -74,16 +81,21 @@ def cli():
 
 def _get_workspace_summary(conn) -> list[dict]:
     """Query per-workspace summary: run count, avg DQI, total cost."""
-    rows = conn.execute("""
-        SELECT r.workspace,
-               COUNT(*) as run_count,
-               AVG(e.score) as avg_dqi,
-               COALESCE(SUM(r.cost_usd), 0) as total_cost
-        FROM runs r
-        LEFT JOIN evaluations e ON e.run_id = r.id AND e.eval_type = 'dqi'
-        GROUP BY r.workspace
-        ORDER BY r.workspace
-    """).fetchall()
+    join = runs_table.outerjoin(
+        evaluations_table,
+        and_(evaluations_table.c.run_id == runs_table.c.id,
+             evaluations_table.c.eval_type == "dqi"),
+    )
+    rows = conn.execute(
+        select(
+            runs_table.c.workspace,
+            func.count().label("run_count"),
+            func.avg(evaluations_table.c.score).label("avg_dqi"),
+            func.coalesce(func.sum(runs_table.c.cost_usd), 0).label("total_cost"),
+        ).select_from(join)
+        .group_by(runs_table.c.workspace)
+        .order_by(runs_table.c.workspace)
+    ).mappings().fetchall()
     return [dict(r) for r in rows]
 
 
@@ -220,7 +232,6 @@ def _display_results_table(summaries: list[dict]):
 def _run_interactive_setup_first_run():
     """First-run setup: init, discover, import, score, MCP config."""
     from qualito.config import init_project
-    from qualito.core.db import get_db
     from qualito.importer import discover_all_projects, import_project
 
     # 1. Init global directory
@@ -277,7 +288,8 @@ def _run_interactive_setup_first_run():
 
     # 7. Import with progress
     click.echo("\nImporting sessions...")
-    conn = get_db(db_path=db_path)
+    engine = get_engine(str(db_path))
+    conn = get_sa_connection(engine)
     try:
         total_imported = 0
         total_skipped = 0
@@ -313,7 +325,6 @@ def _run_interactive_setup_first_run():
 def _run_interactive_setup_rerun():
     """Re-run setup: show current state, offer options."""
     from qualito.config import load_config
-    from qualito.core.db import get_db
     from qualito.importer import discover_all_projects, import_project
 
     config = load_config()
@@ -321,13 +332,16 @@ def _run_interactive_setup_rerun():
     if not db_path.is_absolute():
         db_path = Path.cwd() / db_path
 
-    conn = get_db(db_path=db_path)
+    engine = get_engine(str(db_path))
+    conn = get_sa_connection(engine)
     try:
         # Show current state
-        run_count = conn.execute("SELECT COUNT(*) as n FROM runs").fetchone()["n"]
+        run_count = conn.execute(
+            select(func.count().label("n")).select_from(runs_table)
+        ).mappings().fetchone()["n"]
         ws_count = conn.execute(
-            "SELECT COUNT(DISTINCT workspace) as n FROM runs"
-        ).fetchone()["n"]
+            select(func.count(runs_table.c.workspace.distinct()).label("n"))
+        ).mappings().fetchone()["n"]
         click.echo(
             f"Found existing Qualito config. "
             f"{ws_count} workspace(s), {run_count} runs imported.\n"
@@ -349,7 +363,7 @@ def _run_interactive_setup_rerun():
             from qualito.core.dqi import store_dqi
             from qualito.core.evaluator import auto_evaluate
 
-            runs = conn.execute("SELECT id FROM runs").fetchall()
+            runs = conn.execute(select(runs_table.c.id)).mappings().fetchall()
             with click.progressbar(runs, label="  Scoring", show_pos=True) as bar:
                 for r in bar:
                     auto_evaluate(r["id"], conn=conn)
@@ -397,8 +411,8 @@ def _run_interactive_setup_rerun():
             existing_ws = {
                 r["workspace"]
                 for r in conn.execute(
-                    "SELECT DISTINCT workspace FROM runs"
-                ).fetchall()
+                    select(runs_table.c.workspace.distinct())
+                ).mappings().fetchall()
             }
             new_projects = [p for p in projects if p["name"] not in existing_ws]
 
@@ -471,7 +485,6 @@ def setup(token):
             "Running local setup...\n"
         )
         from qualito.config import init_project
-        from qualito.core.db import get_db
         from qualito.importer import discover_all_projects, import_project
 
         config, qualito_dir = init_project(local=False)
@@ -485,7 +498,8 @@ def setup(token):
             return
 
         click.echo(f"Found {len(projects)} project(s). Importing all...\n")
-        conn = get_db(db_path=db_path)
+        engine = get_engine(str(db_path))
+        conn = get_sa_connection(engine)
         try:
             total_imported = 0
             total_skipped = 0
@@ -600,10 +614,11 @@ def status(project_dir: Path | None):
 
     # Run count
     if db_path.exists():
-        from qualito.core.db import get_db
-
-        conn = get_db(db_path=db_path)
-        row = conn.execute("SELECT COUNT(*) as n FROM runs").fetchone()
+        engine = get_engine(str(db_path))
+        conn = get_sa_connection(engine)
+        row = conn.execute(
+            select(func.count().label("n")).select_from(runs_table)
+        ).mappings().fetchone()
         run_count = row["n"]
         conn.close()
         click.echo(f"Runs: {run_count}")
@@ -627,7 +642,6 @@ def import_sessions(project_dir: Path | None, workspace: str | None, all_project
         project_dir = Path.cwd()
 
     from qualito.config import load_config
-    from qualito.core.db import get_db
 
     config = load_config(project_dir)
     db_path = config.db_path
@@ -647,7 +661,8 @@ def import_sessions(project_dir: Path | None, workspace: str | None, all_project
         for p in projects:
             click.echo(f"  {p['name']} ({p['session_count']} sessions)")
 
-        conn = get_db(db_path=db_path)
+        engine = get_engine(str(db_path))
+        conn = get_sa_connection(engine)
         try:
             total_imported = 0
             total_skipped = 0
@@ -696,7 +711,8 @@ def import_sessions(project_dir: Path | None, workspace: str | None, all_project
 
     click.echo(f"Found {len(files)} session file(s) for {project_dir}")
 
-    conn = get_db(db_path=db_path)
+    engine = get_engine(str(db_path))
+    conn = get_sa_connection(engine)
     try:
         result = import_all(conn, project_dir=project_dir, workspace=ws)
 
@@ -724,20 +740,22 @@ def score(workspace: str | None, days: int, limit: int):
     conn, config = _get_conn()
     try:
         since = _since_date(days)
-        ws_filter = "AND r.workspace = ?" if workspace else ""
-        params: list = [since]
+        join = evaluations_table.join(runs_table, evaluations_table.c.run_id == runs_table.c.id)
+        conds = [evaluations_table.c.eval_type == "dqi", runs_table.c.started_at >= since]
         if workspace:
-            params.append(workspace)
+            conds.append(runs_table.c.workspace == workspace)
 
-        rows = conn.execute(f"""
-            SELECT r.id, r.workspace, r.task_type, e.score as dqi,
-                   e.categories, r.cost_usd, r.started_at
-            FROM evaluations e
-            JOIN runs r ON r.id = e.run_id
-            WHERE e.eval_type = 'dqi' AND r.started_at >= ? {ws_filter}
-            ORDER BY r.started_at DESC
-            LIMIT ?
-        """, params + [limit]).fetchall()
+        rows = conn.execute(
+            select(
+                runs_table.c.id, runs_table.c.workspace, runs_table.c.task_type,
+                evaluations_table.c.score.label("dqi"),
+                evaluations_table.c.categories, runs_table.c.cost_usd,
+                runs_table.c.started_at,
+            ).select_from(join)
+            .where(and_(*conds))
+            .order_by(runs_table.c.started_at.desc())
+            .limit(limit)
+        ).mappings().fetchall()
 
         if not rows:
             click.echo(f"No DQI scores found in the last {days} days.")
@@ -822,20 +840,18 @@ def costs(workspace: str | None, days: int):
     conn, config = _get_conn()
     try:
         since = _since_date(days)
-        ws_filter = "AND workspace = ?" if workspace else ""
-        ws_filter_r = "AND r.workspace = ?" if workspace else ""
-        params: list = [since]
+        base_conds = [runs_table.c.started_at >= since]
         if workspace:
-            params.append(workspace)
+            base_conds.append(runs_table.c.workspace == workspace)
 
         # Overall stats
-        stats = conn.execute(f"""
-            SELECT COUNT(*) as total_runs,
-                   COALESCE(SUM(cost_usd), 0) as total_spend,
-                   AVG(cost_usd) as avg_per_run
-            FROM runs
-            WHERE started_at >= ? {ws_filter}
-        """, params).fetchone()
+        stats = conn.execute(
+            select(
+                func.count().label("total_runs"),
+                func.coalesce(func.sum(runs_table.c.cost_usd), 0).label("total_spend"),
+                func.avg(runs_table.c.cost_usd).label("avg_per_run"),
+            ).where(and_(*base_conds))
+        ).mappings().fetchone()
 
         total_runs = stats["total_runs"]
         total_spend = stats["total_spend"] or 0
@@ -848,16 +864,16 @@ def costs(workspace: str | None, days: int):
         click.echo(f"Avg per run:    {_fmt_cost(avg_per_run)}")
 
         # Cost by workspace
-        ws_rows = conn.execute(f"""
-            SELECT workspace,
-                   COUNT(*) as runs,
-                   COALESCE(SUM(cost_usd), 0) as total,
-                   AVG(cost_usd) as avg
-            FROM runs
-            WHERE started_at >= ? {ws_filter}
-            GROUP BY workspace
-            ORDER BY total DESC
-        """, params).fetchall()
+        ws_rows = conn.execute(
+            select(
+                runs_table.c.workspace,
+                func.count().label("runs"),
+                func.coalesce(func.sum(runs_table.c.cost_usd), 0).label("total"),
+                func.avg(runs_table.c.cost_usd).label("avg"),
+            ).where(and_(*base_conds))
+            .group_by(runs_table.c.workspace)
+            .order_by(func.coalesce(func.sum(runs_table.c.cost_usd), 0).desc())
+        ).mappings().fetchall()
 
         if ws_rows:
             click.echo(f"\n{'Workspace':<25} {'Runs':>6} {'Total':>10} {'Avg':>10}")
@@ -869,16 +885,16 @@ def costs(workspace: str | None, days: int):
                 )
 
         # Cost by task type
-        type_rows = conn.execute(f"""
-            SELECT task_type,
-                   COUNT(*) as runs,
-                   COALESCE(SUM(cost_usd), 0) as total,
-                   AVG(cost_usd) as avg
-            FROM runs
-            WHERE started_at >= ? {ws_filter}
-            GROUP BY task_type
-            ORDER BY total DESC
-        """, params).fetchall()
+        type_rows = conn.execute(
+            select(
+                runs_table.c.task_type,
+                func.count().label("runs"),
+                func.coalesce(func.sum(runs_table.c.cost_usd), 0).label("total"),
+                func.avg(runs_table.c.cost_usd).label("avg"),
+            ).where(and_(*base_conds))
+            .group_by(runs_table.c.task_type)
+            .order_by(func.coalesce(func.sum(runs_table.c.cost_usd), 0).desc())
+        ).mappings().fetchall()
 
         if type_rows:
             click.echo(f"\n{'Task Type':<25} {'Runs':>6} {'Total':>10} {'Avg':>10}")
@@ -890,17 +906,19 @@ def costs(workspace: str | None, days: int):
                 )
 
         # Waste: runs with DQI < 0.5
-        waste_params: list = [since]
-        if workspace:
-            waste_params.append(workspace)
+        waste_join = runs_table.join(
+            evaluations_table,
+            and_(evaluations_table.c.run_id == runs_table.c.id,
+                 evaluations_table.c.eval_type == "dqi"),
+        )
+        waste_conds = list(base_conds) + [evaluations_table.c.score < 0.5]
 
-        waste = conn.execute(f"""
-            SELECT COUNT(*) as waste_runs,
-                   COALESCE(SUM(r.cost_usd), 0) as waste_cost
-            FROM runs r
-            JOIN evaluations e ON e.run_id = r.id AND e.eval_type = 'dqi'
-            WHERE r.started_at >= ? {ws_filter_r} AND e.score < 0.5
-        """, waste_params).fetchone()
+        waste = conn.execute(
+            select(
+                func.count().label("waste_runs"),
+                func.coalesce(func.sum(runs_table.c.cost_usd), 0).label("waste_cost"),
+            ).select_from(waste_join).where(and_(*waste_conds))
+        ).mappings().fetchone()
 
         waste_runs = waste["waste_runs"]
         waste_cost = waste["waste_cost"] or 0
@@ -912,13 +930,14 @@ def costs(workspace: str | None, days: int):
         click.echo(f"Wasted cost:    {_fmt_cost(waste_cost)} ({waste_pct:.1f}% of total)")
 
         # Top 5 most expensive runs
-        top_rows = conn.execute(f"""
-            SELECT id, workspace, task_type, cost_usd, started_at
-            FROM runs
-            WHERE started_at >= ? {ws_filter} AND cost_usd IS NOT NULL
-            ORDER BY cost_usd DESC
-            LIMIT 5
-        """, params).fetchall()
+        top_rows = conn.execute(
+            select(
+                runs_table.c.id, runs_table.c.workspace, runs_table.c.task_type,
+                runs_table.c.cost_usd, runs_table.c.started_at,
+            ).where(and_(*base_conds, runs_table.c.cost_usd.isnot(None)))
+            .order_by(runs_table.c.cost_usd.desc())
+            .limit(5)
+        ).mappings().fetchall()
 
         if top_rows:
             click.echo(f"\nTop 5 Most Expensive Runs")
@@ -1015,11 +1034,9 @@ def slo(workspace: str | None, days: int):
     conn, config = _get_conn()
     try:
         since = _since_date(days)
-        ws_filter = "AND workspace = ?" if workspace else ""
-        ws_filter_r = "AND r.workspace = ?" if workspace else ""
-        params: list = [since]
+        base_conds = [runs_table.c.started_at >= since]
         if workspace:
-            params.append(workspace)
+            base_conds.append(runs_table.c.workspace == workspace)
 
         # Load SLO targets from config
         slo_quality_threshold = config.slo_quality  # e.g. 0.60
@@ -1027,30 +1044,28 @@ def slo(workspace: str | None, days: int):
         slo_cost_threshold = config.slo_cost  # e.g. 3.00
 
         # Total runs
-        total_row = conn.execute(f"""
-            SELECT COUNT(*) as total,
-                   SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
-                   SUM(CASE WHEN cost_usd < ? THEN 1 ELSE 0 END) as under_cost
-            FROM runs
-            WHERE started_at >= ? {ws_filter.replace('workspace', 'workspace')}
-        """, [slo_cost_threshold, since] + ([workspace] if workspace else [])).fetchone()
+        total_row = conn.execute(
+            select(
+                func.count().label("total"),
+                func.sum(case((runs_table.c.status == "completed", 1), else_=0)).label("completed"),
+                func.sum(case((runs_table.c.cost_usd < slo_cost_threshold, 1), else_=0)).label("under_cost"),
+            ).where(and_(*base_conds))
+        ).mappings().fetchone()
 
         total = total_row["total"] or 0
         completed = total_row["completed"] or 0
         under_cost = total_row["under_cost"] or 0
 
         # Quality: runs with DQI >= threshold
-        quality_params: list = [slo_quality_threshold, since]
-        if workspace:
-            quality_params.append(workspace)
+        join = evaluations_table.join(runs_table, evaluations_table.c.run_id == runs_table.c.id)
+        quality_conds = list(base_conds) + [evaluations_table.c.eval_type == "dqi"]
 
-        quality_row = conn.execute(f"""
-            SELECT COUNT(*) as total_scored,
-                   SUM(CASE WHEN e.score >= ? THEN 1 ELSE 0 END) as quality_ok
-            FROM evaluations e
-            JOIN runs r ON r.id = e.run_id
-            WHERE e.eval_type = 'dqi' AND r.started_at >= ? {ws_filter_r}
-        """, quality_params).fetchone()
+        quality_row = conn.execute(
+            select(
+                func.count().label("total_scored"),
+                func.sum(case((evaluations_table.c.score >= slo_quality_threshold, 1), else_=0)).label("quality_ok"),
+            ).select_from(join).where(and_(*quality_conds))
+        ).mappings().fetchone()
 
         total_scored = quality_row["total_scored"] or 0
         quality_ok = quality_row["quality_ok"] or 0
@@ -1099,11 +1114,11 @@ def slo(workspace: str | None, days: int):
 
         # Per-workspace breakdown (only when no workspace filter)
         if not workspace:
-            ws_rows = conn.execute(f"""
-                SELECT DISTINCT workspace FROM runs
-                WHERE started_at >= ?
-                ORDER BY workspace
-            """, [since]).fetchall()
+            ws_rows = conn.execute(
+                select(runs_table.c.workspace.distinct())
+                .where(runs_table.c.started_at >= since)
+                .order_by(runs_table.c.workspace)
+            ).mappings().fetchall()
 
             if len(ws_rows) > 1:
                 click.echo(f"\nPer-Workspace Breakdown")
@@ -1114,16 +1129,17 @@ def slo(workspace: str | None, days: int):
 
                 for ws_row in ws_rows:
                     ws_name = ws_row["workspace"]
+                    ws_conds = [runs_table.c.started_at >= since, runs_table.c.workspace == ws_name]
 
                     # Quality for this workspace
-                    wq = conn.execute("""
-                        SELECT COUNT(*) as total_scored,
-                               SUM(CASE WHEN e.score >= ? THEN 1 ELSE 0 END) as ok
-                        FROM evaluations e
-                        JOIN runs r ON r.id = e.run_id
-                        WHERE e.eval_type = 'dqi' AND r.started_at >= ?
-                              AND r.workspace = ?
-                    """, [slo_quality_threshold, since, ws_name]).fetchone()
+                    wq = conn.execute(
+                        select(
+                            func.count().label("total_scored"),
+                            func.sum(case((evaluations_table.c.score >= slo_quality_threshold, 1), else_=0)).label("ok"),
+                        ).select_from(join).where(and_(
+                            evaluations_table.c.eval_type == "dqi", *ws_conds
+                        ))
+                    ).mappings().fetchone()
 
                     ws_q = (
                         _fmt_pct(wq["ok"] / wq["total_scored"] * 100)
@@ -1131,12 +1147,12 @@ def slo(workspace: str | None, days: int):
                     )
 
                     # Availability for this workspace
-                    wa = conn.execute("""
-                        SELECT COUNT(*) as total,
-                               SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as ok
-                        FROM runs
-                        WHERE started_at >= ? AND workspace = ?
-                    """, [since, ws_name]).fetchone()
+                    wa = conn.execute(
+                        select(
+                            func.count().label("total"),
+                            func.sum(case((runs_table.c.status == "completed", 1), else_=0)).label("ok"),
+                        ).where(and_(*ws_conds))
+                    ).mappings().fetchone()
 
                     ws_a = (
                         _fmt_pct(wa["ok"] / wa["total"] * 100)
@@ -1144,12 +1160,12 @@ def slo(workspace: str | None, days: int):
                     )
 
                     # Cost for this workspace
-                    wc = conn.execute("""
-                        SELECT COUNT(*) as total,
-                               SUM(CASE WHEN cost_usd < ? THEN 1 ELSE 0 END) as ok
-                        FROM runs
-                        WHERE started_at >= ? AND workspace = ?
-                    """, [slo_cost_threshold, since, ws_name]).fetchone()
+                    wc = conn.execute(
+                        select(
+                            func.count().label("total"),
+                            func.sum(case((runs_table.c.cost_usd < slo_cost_threshold, 1), else_=0)).label("ok"),
+                        ).where(and_(*ws_conds))
+                    ).mappings().fetchone()
 
                     ws_c = (
                         _fmt_pct(wc["ok"] / wc["total"] * 100)

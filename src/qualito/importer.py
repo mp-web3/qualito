@@ -11,14 +11,16 @@ Each JSONL file is one conversation session with events:
 """
 
 import json
-import sqlite3
 from datetime import datetime
 from pathlib import Path
+
+from sqlalchemy import select
 
 from qualito.core.db import (
     insert_file_activity,
     insert_run,
     insert_tool_calls,
+    runs_table,
     update_run,
 )
 from qualito.core.dqi import store_dqi
@@ -167,14 +169,14 @@ def _aggregate_session_usage(session_path: Path) -> dict:
 
 
 def import_session(
-    conn: sqlite3.Connection,
+    conn,
     session_path: Path,
     workspace: str,
 ) -> dict | None:
     """Import a single Claude Code session into the DQI database.
 
     Args:
-        conn: Database connection.
+        conn: Database connection (SA Connection).
         session_path: Path to the session JSONL file.
         workspace: Workspace name for the run.
 
@@ -185,7 +187,7 @@ def import_session(
 
     # Skip if already imported
     existing = conn.execute(
-        "SELECT id FROM runs WHERE id = ?", (run_id,)
+        select(runs_table.c.id).where(runs_table.c.id == run_id)
     ).fetchone()
     if existing:
         return None
@@ -322,7 +324,7 @@ def discover_all_projects(
 def import_project(
     project_key: str,
     workspace_name: str,
-    conn: sqlite3.Connection,
+    conn,
     date_range: tuple | None = None,
     claude_projects_dir: Path | None = None,
 ) -> dict:
@@ -385,7 +387,7 @@ def import_project(
 
 
 def import_all(
-    conn: sqlite3.Connection,
+    conn,
     project_dir: Path | None = None,
     workspace: str = "default",
 ) -> dict:

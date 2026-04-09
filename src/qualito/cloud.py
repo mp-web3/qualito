@@ -5,11 +5,18 @@ Credentials stored at ~/.qualito/credentials.json.
 """
 
 import json
-import sqlite3
 import stat
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+from sqlalchemy import select
+
+from qualito.core.db import (
+    get_run,
+    incidents_table,
+    runs_table,
+)
 
 DEFAULT_API_URL = "https://api.qualito.dev"
 CREDENTIALS_PATH = Path.home() / ".qualito" / "credentials.json"
@@ -100,51 +107,27 @@ def cloud_request(method: str, path: str, data: dict | None = None) -> dict:
         raise CloudError(f"Cannot reach {api_url}: {e.reason}")
 
 
-def _collect_run_data(conn: sqlite3.Connection, run_id: str) -> dict:
+def _collect_run_data(conn, run_id: str) -> dict:
     """Collect a run with its evaluations, tool_calls, and file_activity."""
-    row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-    if not row:
-        return {}
-    run = dict(row)
-
-    # Evaluations
-    evals = conn.execute(
-        "SELECT * FROM evaluations WHERE run_id = ? ORDER BY id", (run_id,)
-    ).fetchall()
-    run["evaluations"] = [dict(r) for r in evals]
-
-    # Tool calls
-    tcs = conn.execute(
-        "SELECT * FROM tool_calls WHERE run_id = ? ORDER BY id", (run_id,)
-    ).fetchall()
-    run["tool_calls"] = [dict(r) for r in tcs]
-
-    # File activity
-    fas = conn.execute(
-        "SELECT * FROM file_activity WHERE run_id = ? ORDER BY id", (run_id,)
-    ).fetchall()
-    run["file_activity"] = [dict(r) for r in fas]
-
-    return run
+    return get_run(conn, run_id) or {}
 
 
-def sync_runs(conn: sqlite3.Connection, since: str | None = None) -> dict:
+def sync_runs(conn, since: str | None = None) -> dict:
     """Sync local runs to the cloud API.
 
     Args:
-        conn: Local SQLite connection.
+        conn: Database connection (SA Connection).
         since: ISO date string — only sync runs started after this date.
                If None, syncs all runs.
 
     Returns:
         dict with keys: synced, skipped, errors.
     """
-    where = "WHERE started_at >= ?" if since else ""
-    params = [since] if since else []
+    stmt = select(runs_table.c.id).order_by(runs_table.c.started_at)
+    if since:
+        stmt = stmt.where(runs_table.c.started_at >= since)
 
-    rows = conn.execute(
-        f"SELECT id FROM runs {where} ORDER BY started_at ASC", params
-    ).fetchall()
+    rows = conn.execute(stmt).mappings().fetchall()
 
     if not rows:
         return {"synced": 0, "skipped": 0, "errors": 0}
@@ -175,15 +158,15 @@ def sync_runs(conn: sqlite3.Connection, since: str | None = None) -> dict:
     return {"synced": total_synced, "skipped": total_skipped, "errors": total_errors}
 
 
-def sync_incidents(conn: sqlite3.Connection) -> dict:
+def sync_incidents(conn) -> dict:
     """Sync local incidents to the cloud API.
 
     Returns:
         dict with keys: synced, skipped, errors.
     """
     rows = conn.execute(
-        "SELECT * FROM incidents ORDER BY created_at ASC"
-    ).fetchall()
+        select(incidents_table).order_by(incidents_table.c.created_at)
+    ).mappings().fetchall()
 
     if not rows:
         return {"synced": 0, "skipped": 0, "errors": 0}

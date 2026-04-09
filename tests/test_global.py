@@ -247,10 +247,12 @@ def _make_session_jsonl(path: Path, session_id: str, task: str = "test task"):
 
 def test_idempotent_import(tmp_path):
     """Importing the same session twice produces no duplicates."""
-    from qualito.core.db import get_db
+    from sqlalchemy import func, select
+    from qualito.core.db import get_engine, get_sa_connection, runs_table
 
     db_path = tmp_path / "test.db"
-    conn = get_db(db_path=db_path)
+    engine = get_engine(str(db_path))
+    conn = get_sa_connection(engine)
 
     session_file = tmp_path / "abc12345-6789-0000-0000-000000000001.jsonl"
     _make_session_jsonl(session_file, "abc12345-6789-0000-0000-000000000001")
@@ -265,7 +267,9 @@ def test_idempotent_import(tmp_path):
     assert result2 is None
 
     # Verify only one run in DB
-    count = conn.execute("SELECT COUNT(*) as n FROM runs").fetchone()["n"]
+    count = conn.execute(
+        select(func.count().label("n")).select_from(runs_table)
+    ).mappings().fetchone()["n"]
     assert count == 1
 
     conn.close()
@@ -273,10 +277,11 @@ def test_idempotent_import(tmp_path):
 
 def test_import_project_function(tmp_path):
     """import_project imports sessions from a project folder."""
-    from qualito.core.db import get_db
+    from qualito.core.db import get_engine, get_sa_connection
 
     db_path = tmp_path / "test.db"
-    conn = get_db(db_path=db_path)
+    engine = get_engine(str(db_path))
+    conn = get_sa_connection(engine)
 
     # Create mock claude projects structure
     claude_dir = tmp_path / "claude-projects"
@@ -315,10 +320,11 @@ def test_import_project_function(tmp_path):
 
 def test_import_project_nonexistent(tmp_path):
     """import_project with nonexistent folder returns empty result."""
-    from qualito.core.db import get_db
+    from qualito.core.db import get_engine, get_sa_connection
 
     db_path = tmp_path / "test.db"
-    conn = get_db(db_path=db_path)
+    engine = get_engine(str(db_path))
+    conn = get_sa_connection(engine)
 
     result = import_project(
         project_key="-does-not-exist",

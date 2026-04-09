@@ -11,6 +11,14 @@ import sys
 from datetime import datetime, timedelta
 
 from mcp.server.fastmcp import FastMCP
+from sqlalchemy import and_, case, func, select
+
+from qualito.core.db import (
+    evaluations_table,
+    get_sa_connection,
+    incidents_table,
+    runs_table,
+)
 
 # Configure logging to stderr — stdout is reserved for JSON-RPC
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s: %(message)s")
@@ -19,10 +27,9 @@ logger = logging.getLogger("qualito-mcp")
 mcp = FastMCP("qualito")
 
 
-def _get_db():
-    """Get a short-lived DB connection using DQI's standard resolution."""
-    from qualito.core.db import get_db
-    return get_db()
+def _get_conn():
+    """Get a short-lived SA connection using Qualito's standard resolution."""
+    return get_sa_connection()
 
 
 def _since_date(days: int) -> str:
@@ -63,40 +70,37 @@ def dqi_score(workspace: str = "", days: int = 30) -> str:
         workspace: Filter by workspace name. Empty string = all workspaces.
         days: Number of days to look back (default 30).
     """
-    conn = _get_db()
+    conn = _get_conn()
     try:
         since = _since_date(days)
-        ws_filter = "AND r.workspace = ?" if workspace else ""
-        params: list = [since]
+        join = evaluations_table.join(runs_table, evaluations_table.c.run_id == runs_table.c.id)
+        base_conds = [evaluations_table.c.eval_type == "dqi", runs_table.c.started_at >= since]
         if workspace:
-            params.append(workspace)
+            base_conds.append(runs_table.c.workspace == workspace)
 
         # Average DQI from evaluations
-        avg_row = conn.execute(f"""
-            SELECT AVG(e.score) as avg_dqi, COUNT(e.id) as scored_runs
-            FROM evaluations e
-            JOIN runs r ON r.id = e.run_id
-            WHERE e.eval_type = 'dqi' AND r.started_at >= ? {ws_filter}
-        """, params).fetchone()
+        avg_row = conn.execute(
+            select(
+                func.avg(evaluations_table.c.score).label("avg_dqi"),
+                func.count(evaluations_table.c.id).label("scored_runs"),
+            ).select_from(join).where(and_(*base_conds))
+        ).mappings().fetchone()
 
         # Last 10 runs for trend
-        trend_rows = conn.execute(f"""
-            SELECT e.score, r.started_at
-            FROM evaluations e
-            JOIN runs r ON r.id = e.run_id
-            WHERE e.eval_type = 'dqi' AND r.started_at >= ? {ws_filter}
-            ORDER BY r.started_at DESC
-            LIMIT 10
-        """, params).fetchall()
+        trend_rows = conn.execute(
+            select(evaluations_table.c.score, runs_table.c.started_at)
+            .select_from(join)
+            .where(and_(*base_conds))
+            .order_by(runs_table.c.started_at.desc())
+            .limit(10)
+        ).mappings().fetchall()
 
         # Component breakdown (avg of categories JSON)
-        cat_rows = conn.execute(f"""
-            SELECT e.categories
-            FROM evaluations e
-            JOIN runs r ON r.id = e.run_id
-            WHERE e.eval_type = 'dqi' AND r.started_at >= ? {ws_filter}
-                  AND e.categories IS NOT NULL
-        """, params).fetchall()
+        cat_rows = conn.execute(
+            select(evaluations_table.c.categories)
+            .select_from(join)
+            .where(and_(*base_conds, evaluations_table.c.categories.isnot(None)))
+        ).mappings().fetchall()
 
         components = {"completion": [], "quality": [], "efficiency": [], "cost_score": []}
         tier_counts = {}
@@ -145,48 +149,48 @@ def dqi_cost(workspace: str = "", days: int = 30) -> str:
         workspace: Filter by workspace name. Empty string = all workspaces.
         days: Number of days to look back (default 30).
     """
-    conn = _get_db()
+    conn = _get_conn()
     try:
         since = _since_date(days)
-        ws_filter = "AND workspace = ?" if workspace else ""
-        params: list = [since]
+        base_conds = [runs_table.c.started_at >= since, runs_table.c.source == "delegation"]
         if workspace:
-            params.append(workspace)
+            base_conds.append(runs_table.c.workspace == workspace)
 
         # Overall cost stats
-        stats = conn.execute(f"""
-            SELECT COUNT(*) as total_runs,
-                   COALESCE(SUM(cost_usd), 0) as total_spend,
-                   AVG(cost_usd) as avg_per_run
-            FROM runs
-            WHERE started_at >= ? {ws_filter} AND source = 'delegation'
-        """, params).fetchone()
+        stats = conn.execute(
+            select(
+                func.count().label("total_runs"),
+                func.coalesce(func.sum(runs_table.c.cost_usd), 0).label("total_spend"),
+                func.avg(runs_table.c.cost_usd).label("avg_per_run"),
+            ).where(and_(*base_conds))
+        ).mappings().fetchone()
 
         # Daily trend (last N days)
-        daily = conn.execute(f"""
-            SELECT DATE(started_at) as day,
-                   COUNT(*) as runs,
-                   COALESCE(SUM(cost_usd), 0) as spend
-            FROM runs
-            WHERE started_at >= ? {ws_filter} AND source = 'delegation'
-            GROUP BY DATE(started_at)
-            ORDER BY day DESC
-        """, params).fetchall()
+        day_col = func.date(runs_table.c.started_at).label("day")
+        daily = conn.execute(
+            select(
+                day_col,
+                func.count().label("runs"),
+                func.coalesce(func.sum(runs_table.c.cost_usd), 0).label("spend"),
+            )
+            .where(and_(*base_conds))
+            .group_by(func.date(runs_table.c.started_at))
+            .order_by(day_col.desc())
+        ).mappings().fetchall()
 
         # Waste: runs with DQI < 0.5
-        waste_params: list = [since]
-        ws_filter_r = "AND r.workspace = ?" if workspace else ""
-        if workspace:
-            waste_params.append(workspace)
-
-        waste = conn.execute(f"""
-            SELECT COUNT(*) as waste_runs,
-                   COALESCE(SUM(r.cost_usd), 0) as waste_cost
-            FROM runs r
-            JOIN evaluations e ON e.run_id = r.id AND e.eval_type = 'dqi'
-            WHERE r.started_at >= ? {ws_filter_r}
-                  AND r.source = 'delegation' AND e.score < 0.5
-        """, waste_params).fetchone()
+        waste_join = runs_table.join(
+            evaluations_table,
+            and_(evaluations_table.c.run_id == runs_table.c.id,
+                 evaluations_table.c.eval_type == "dqi"),
+        )
+        waste_conds = list(base_conds) + [evaluations_table.c.score < 0.5]
+        waste = conn.execute(
+            select(
+                func.count().label("waste_runs"),
+                func.coalesce(func.sum(runs_table.c.cost_usd), 0).label("waste_cost"),
+            ).select_from(waste_join).where(and_(*waste_conds))
+        ).mappings().fetchone()
 
         return json.dumps({
             "total_runs": stats["total_runs"],
@@ -254,7 +258,7 @@ def dqi_warnings(workspace: str = "") -> str:
         get_flagged_combos,
     )
 
-    conn = _get_db()
+    conn = _get_conn()
     try:
         combos = get_flagged_combos(
             conn, threshold=0.75, min_runs=3,
@@ -446,37 +450,44 @@ def dqi_incidents(workspace: str = "", status: str = "active") -> str:
         workspace: Filter by workspace name. Empty string = all workspaces.
         status: Filter by status — 'active' (non-resolved), 'resolved', or 'all' (default 'active').
     """
-    conn = _get_db()
+    conn = _get_conn()
     try:
-        where_parts = []
-        params: list = []
+        conditions: list = []
 
         if status == "active":
-            where_parts.append("status NOT IN ('resolved', 'false_positive')")
+            conditions.append(incidents_table.c.status.notin_(["resolved", "false_positive"]))
         elif status == "resolved":
-            where_parts.append("status = 'resolved'")
+            conditions.append(incidents_table.c.status == "resolved")
         # 'all' — no status filter
 
         if workspace:
-            where_parts.append("workspace = ?")
-            params.append(workspace)
+            conditions.append(incidents_table.c.workspace == workspace)
 
-        where = "WHERE " + " AND ".join(where_parts) if where_parts else ""
+        severity_order = case(
+            (incidents_table.c.severity == "critical", 0),
+            (incidents_table.c.severity == "high", 1),
+            (incidents_table.c.severity == "medium", 2),
+            else_=3,
+        )
 
-        rows = conn.execute(f"""
-            SELECT id, incident_key, category, severity, status, workspace,
-                   task_type, title, description, detection_method,
-                   trigger_metric, trigger_value, baseline_value,
-                   total_affected_runs, cost_impact_usd,
-                   created_at, confirmed_at, resolved_at
-            FROM incidents
-            {where}
-            ORDER BY
-                CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1
-                     WHEN 'medium' THEN 2 ELSE 3 END,
-                created_at DESC
-        """, params).fetchall()
+        cols = [
+            incidents_table.c.id, incidents_table.c.incident_key,
+            incidents_table.c.category, incidents_table.c.severity,
+            incidents_table.c.status, incidents_table.c.workspace,
+            incidents_table.c.task_type, incidents_table.c.title,
+            incidents_table.c.description, incidents_table.c.detection_method,
+            incidents_table.c.trigger_metric, incidents_table.c.trigger_value,
+            incidents_table.c.baseline_value, incidents_table.c.total_affected_runs,
+            incidents_table.c.cost_impact_usd, incidents_table.c.created_at,
+            incidents_table.c.confirmed_at, incidents_table.c.resolved_at,
+        ]
 
+        stmt = select(*cols)
+        if conditions:
+            stmt = stmt.where(and_(*conditions))
+        stmt = stmt.order_by(severity_order, incidents_table.c.created_at.desc())
+
+        rows = conn.execute(stmt).mappings().fetchall()
         incidents = [dict(r) for r in rows]
 
         return json.dumps({
@@ -504,41 +515,36 @@ def dqi_slo(workspace: str = "") -> str:
     Args:
         workspace: Filter by workspace name. Empty string = all workspaces.
     """
-    conn = _get_db()
+    conn = _get_conn()
     try:
         since = _since_date(30)
-        ws_filter = "AND workspace = ?" if workspace else ""
-        ws_filter_r = "AND r.workspace = ?" if workspace else ""
-        params: list = [since]
+        base_conds = [runs_table.c.started_at >= since, runs_table.c.source == "delegation"]
         if workspace:
-            params.append(workspace)
+            base_conds.append(runs_table.c.workspace == workspace)
 
         # Total runs
-        total_row = conn.execute(f"""
-            SELECT COUNT(*) as total,
-                   SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
-                   SUM(CASE WHEN cost_usd < 3.00 THEN 1 ELSE 0 END) as under_cost
-            FROM runs
-            WHERE started_at >= ? {ws_filter} AND source = 'delegation'
-        """, params).fetchone()
+        total_row = conn.execute(
+            select(
+                func.count().label("total"),
+                func.sum(case((runs_table.c.status == "completed", 1), else_=0)).label("completed"),
+                func.sum(case((runs_table.c.cost_usd < 3.00, 1), else_=0)).label("under_cost"),
+            ).where(and_(*base_conds))
+        ).mappings().fetchone()
 
         total = total_row["total"] or 0
         completed = total_row["completed"] or 0
         under_cost = total_row["under_cost"] or 0
 
         # Quality: runs with DQI >= 0.60
-        quality_params: list = [since]
-        if workspace:
-            quality_params.append(workspace)
+        join = evaluations_table.join(runs_table, evaluations_table.c.run_id == runs_table.c.id)
+        quality_conds = list(base_conds) + [evaluations_table.c.eval_type == "dqi"]
 
-        quality_row = conn.execute(f"""
-            SELECT COUNT(*) as total_scored,
-                   SUM(CASE WHEN e.score >= 0.60 THEN 1 ELSE 0 END) as quality_ok
-            FROM evaluations e
-            JOIN runs r ON r.id = e.run_id
-            WHERE e.eval_type = 'dqi' AND r.started_at >= ? {ws_filter_r}
-                  AND r.source = 'delegation'
-        """, quality_params).fetchone()
+        quality_row = conn.execute(
+            select(
+                func.count().label("total_scored"),
+                func.sum(case((evaluations_table.c.score >= 0.60, 1), else_=0)).label("quality_ok"),
+            ).select_from(join).where(and_(*quality_conds))
+        ).mappings().fetchone()
 
         total_scored = quality_row["total_scored"] or 0
         quality_ok = quality_row["quality_ok"] or 0
@@ -635,19 +641,24 @@ def qualito_setup() -> str:
 
     # Case A: Already configured — read stats from DB
     if global_dir.exists() and (global_dir / "qualito.db").exists():
-        conn = _get_db()
+        conn = _get_conn()
         try:
             # Per-workspace stats
-            ws_rows = conn.execute("""
-                SELECT r.workspace,
-                       COUNT(r.id) as run_count,
-                       AVG(e.score) as avg_dqi,
-                       COALESCE(SUM(r.cost_usd), 0) as total_cost
-                FROM runs r
-                LEFT JOIN evaluations e ON e.run_id = r.id AND e.eval_type = 'dqi'
-                GROUP BY r.workspace
-                ORDER BY run_count DESC
-            """).fetchall()
+            join = runs_table.outerjoin(
+                evaluations_table,
+                and_(evaluations_table.c.run_id == runs_table.c.id,
+                     evaluations_table.c.eval_type == "dqi"),
+            )
+            ws_rows = conn.execute(
+                select(
+                    runs_table.c.workspace,
+                    func.count(runs_table.c.id).label("run_count"),
+                    func.avg(evaluations_table.c.score).label("avg_dqi"),
+                    func.coalesce(func.sum(runs_table.c.cost_usd), 0).label("total_cost"),
+                ).select_from(join)
+                .group_by(runs_table.c.workspace)
+                .order_by(func.count(runs_table.c.id).desc())
+            ).mappings().fetchall()
 
             workspaces = []
             total_runs = 0
