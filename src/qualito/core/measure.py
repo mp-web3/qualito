@@ -6,8 +6,19 @@ CUSUM control chart monitoring, and status reporting.
 
 import json
 import random
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from statistics import mean, median
+
+from sqlalchemy import and_, select
+
+from qualito.core.db import (
+    baselines_table,
+    evaluations_table,
+    get_sa_connection,
+    runs_table,
+    system_changes_table,
+)
 
 
 def _beta_samples(alpha: float, beta: float, n: int = 10000) -> list[float]:
@@ -30,6 +41,11 @@ def _percentile(data: list[float], p: float) -> float:
     return s[f] + (k - f) * (s[c] - s[f])
 
 
+# ---------------------------------------------------------------------------
+# SA Core bridge functions (Phase 2)
+# ---------------------------------------------------------------------------
+
+
 def take_baseline(name: str, description: str = "", days: int = 30, conn=None):
     """Snapshot current DQI metrics as a named baseline.
 
@@ -39,22 +55,37 @@ def take_baseline(name: str, description: str = "", days: int = 30, conn=None):
         days: Number of days to look back.
         conn: Optional DB connection. If None, opens and closes its own.
     """
+    if isinstance(conn, sqlite3.Connection):
+        return take_baseline_legacy(name, description=description, days=days, conn=conn)
+
     owns_conn = conn is None
     if owns_conn:
-        from qualito.core.db import get_db
-        conn = get_db()
+        conn = get_sa_connection()
 
     window_end = datetime.now(timezone.utc).isoformat()
     window_start = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
-    rows = conn.execute("""
-        SELECT e.score, e.categories, r.status, r.cost_usd, r.duration_ms,
-               r.workspace, r.task_type
-        FROM evaluations e
-        JOIN runs r ON r.id = e.run_id
-        WHERE e.eval_type = 'dqi'
-          AND r.started_at >= ? AND r.started_at <= ?
-    """, (window_start, window_end)).fetchall()
+    rows = conn.execute(
+        select(
+            evaluations_table.c.score,
+            evaluations_table.c.categories,
+            runs_table.c.status,
+            runs_table.c.cost_usd,
+            runs_table.c.duration_ms,
+            runs_table.c.workspace,
+            runs_table.c.task_type,
+        )
+        .select_from(
+            evaluations_table.join(runs_table, runs_table.c.id == evaluations_table.c.run_id)
+        )
+        .where(
+            and_(
+                evaluations_table.c.eval_type == "dqi",
+                runs_table.c.started_at >= window_start,
+                runs_table.c.started_at <= window_end,
+            )
+        )
+    ).mappings().fetchall()
 
     if not rows:
         print(f"No DQI data in the last {days} days.")
@@ -105,10 +136,16 @@ def take_baseline(name: str, description: str = "", days: int = 30, conn=None):
         "by_task_type": {k: round(mean(v), 4) for k, v in by_tt.items()},
     }
 
-    conn.execute("""
-        INSERT INTO baselines (name, description, window_start, window_end, run_count, metrics)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (name, description, window_start, window_end, len(rows), json.dumps(metrics)))
+    conn.execute(
+        baselines_table.insert().values(
+            name=name,
+            description=description,
+            window_start=window_start,
+            window_end=window_end,
+            run_count=len(rows),
+            metrics=json.dumps(metrics),
+        )
+    )
     conn.commit()
 
     if owns_conn:
@@ -139,21 +176,28 @@ def register_change(change_name: str, description: str = "",
         baseline_name: Specific baseline to compare against. If empty, uses latest.
         conn: Optional DB connection. If None, opens and closes its own.
     """
+    if isinstance(conn, sqlite3.Connection):
+        return register_change_legacy(change_name, description=description,
+                                      baseline_name=baseline_name, conn=conn)
+
     owns_conn = conn is None
     if owns_conn:
-        from qualito.core.db import get_db
-        conn = get_db()
+        conn = get_sa_connection()
 
     baseline = None
     if baseline_name:
         baseline = conn.execute(
-            "SELECT * FROM baselines WHERE name = ? ORDER BY created_at DESC LIMIT 1",
-            (baseline_name,),
-        ).fetchone()
+            select(baselines_table)
+            .where(baselines_table.c.name == baseline_name)
+            .order_by(baselines_table.c.created_at.desc())
+            .limit(1)
+        ).mappings().fetchone()
     else:
         baseline = conn.execute(
-            "SELECT * FROM baselines ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
+            select(baselines_table)
+            .order_by(baselines_table.c.created_at.desc())
+            .limit(1)
+        ).mappings().fetchone()
 
     if not baseline:
         print("No baseline found. Take a baseline first.")
@@ -161,11 +205,15 @@ def register_change(change_name: str, description: str = "",
             conn.close()
         return
 
-    conn.execute("""
-        INSERT INTO system_changes (change_name, description, baseline_id, implemented_at, before_metrics)
-        VALUES (?, ?, ?, ?, ?)
-    """, (change_name, description, baseline["id"],
-          datetime.now(timezone.utc).isoformat(), baseline["metrics"]))
+    conn.execute(
+        system_changes_table.insert().values(
+            change_name=change_name,
+            description=description,
+            baseline_id=baseline["id"],
+            implemented_at=datetime.now(timezone.utc).isoformat(),
+            before_metrics=baseline["metrics"],
+        )
+    )
     conn.commit()
 
     if owns_conn:
@@ -180,14 +228,17 @@ def evaluate_change(change_name: str, conn=None):
         change_name: Name of the registered change to evaluate.
         conn: Optional DB connection. If None, opens and closes its own.
     """
+    if isinstance(conn, sqlite3.Connection):
+        return evaluate_change_legacy(change_name, conn=conn)
+
     owns_conn = conn is None
     if owns_conn:
-        from qualito.core.db import get_db
-        conn = get_db()
+        conn = get_sa_connection()
 
     change = conn.execute(
-        "SELECT * FROM system_changes WHERE change_name = ?", (change_name,)
-    ).fetchone()
+        select(system_changes_table)
+        .where(system_changes_table.c.change_name == change_name)
+    ).mappings().fetchone()
     if not change:
         print(f"Change '{change_name}' not found.")
         if owns_conn:
@@ -197,11 +248,18 @@ def evaluate_change(change_name: str, conn=None):
     before_metrics = json.loads(change["before_metrics"])
 
     # Get DQI scores after the change
-    after_rows = conn.execute("""
-        SELECT e.score FROM evaluations e
-        JOIN runs r ON r.id = e.run_id
-        WHERE e.eval_type = 'dqi' AND r.started_at >= ?
-    """, (change["implemented_at"],)).fetchall()
+    after_rows = conn.execute(
+        select(evaluations_table.c.score)
+        .select_from(
+            evaluations_table.join(runs_table, runs_table.c.id == evaluations_table.c.run_id)
+        )
+        .where(
+            and_(
+                evaluations_table.c.eval_type == "dqi",
+                runs_table.c.started_at >= change["implemented_at"],
+            )
+        )
+    ).mappings().fetchall()
 
     if len(after_rows) < 5:
         print(f"Only {len(after_rows)} runs since change. Need at least 5 for meaningful comparison.")
@@ -238,12 +296,16 @@ def evaluate_change(change_name: str, conn=None):
     else:
         verdict = "INCONCLUSIVE"
 
-    conn.execute("""
-        UPDATE system_changes
-        SET status = ?, after_metrics = ?, p_improvement = ?, effect_size = ?
-        WHERE change_name = ?
-    """, (verdict.lower(), json.dumps({"avg_dqi": round(after_mean, 4), "run_count": after_n}),
-          round(p_improvement, 4), round(effect_size, 4), change_name))
+    conn.execute(
+        system_changes_table.update()
+        .where(system_changes_table.c.change_name == change_name)
+        .values(
+            status=verdict.lower(),
+            after_metrics=json.dumps({"avg_dqi": round(after_mean, 4), "run_count": after_n}),
+            p_improvement=round(p_improvement, 4),
+            effect_size=round(effect_size, 4),
+        )
+    )
     conn.commit()
 
     if owns_conn:
@@ -264,17 +326,26 @@ def monitor(conn=None):
     Args:
         conn: Optional DB connection. If None, opens and closes its own.
     """
+    if isinstance(conn, sqlite3.Connection):
+        return monitor_legacy(conn=conn)
+
     owns_conn = conn is None
     if owns_conn:
-        from qualito.core.db import get_db
-        conn = get_db()
+        conn = get_sa_connection()
 
-    rows = conn.execute("""
-        SELECT e.score, r.started_at, r.id FROM evaluations e
-        JOIN runs r ON r.id = e.run_id
-        WHERE e.eval_type = 'dqi'
-        ORDER BY r.started_at DESC LIMIT 200
-    """).fetchall()
+    rows = conn.execute(
+        select(
+            evaluations_table.c.score,
+            runs_table.c.started_at,
+            runs_table.c.id,
+        )
+        .select_from(
+            evaluations_table.join(runs_table, runs_table.c.id == evaluations_table.c.run_id)
+        )
+        .where(evaluations_table.c.eval_type == "dqi")
+        .order_by(runs_table.c.started_at.desc())
+        .limit(200)
+    ).mappings().fetchall()
 
     if owns_conn:
         conn.close()
@@ -331,6 +402,306 @@ def show_status(conn=None):
     Args:
         conn: Optional DB connection. If None, opens and closes its own.
     """
+    if isinstance(conn, sqlite3.Connection):
+        return show_status_legacy(conn=conn)
+
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_sa_connection()
+
+    baselines = conn.execute(
+        select(baselines_table).order_by(baselines_table.c.created_at.desc())
+    ).mappings().fetchall()
+
+    changes = conn.execute(
+        select(system_changes_table).order_by(system_changes_table.c.created_at.desc())
+    ).mappings().fetchall()
+
+    if owns_conn:
+        conn.close()
+
+    print(f"\n=== Baselines ({len(baselines)}) ===")
+    for b in baselines:
+        metrics = json.loads(b["metrics"])
+        print(f"  {b['name']:30} DQI={metrics['avg_dqi']:.3f}  n={metrics['run_count']}  ({b['created_at'][:10]})")
+
+    print(f"\n=== System Changes ({len(changes)}) ===")
+    for c in changes:
+        status = c["status"] or "measuring"
+        p = f"P={c['p_improvement']:.2f}" if c["p_improvement"] else "pending"
+        print(f"  {c['change_name']:30} {status:14} {p}  ({c['implemented_at'][:10]})")
+
+
+# ---------------------------------------------------------------------------
+# Legacy raw-SQL functions (renamed with _legacy suffix)
+# ---------------------------------------------------------------------------
+
+
+def take_baseline_legacy(name: str, description: str = "", days: int = 30, conn=None):
+    """Legacy: Snapshot baseline using raw SQL."""
+    owns_conn = conn is None
+    if owns_conn:
+        from qualito.core.db import get_db
+        conn = get_db()
+
+    window_end = datetime.now(timezone.utc).isoformat()
+    window_start = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    rows = conn.execute("""
+        SELECT e.score, e.categories, r.status, r.cost_usd, r.duration_ms,
+               r.workspace, r.task_type
+        FROM evaluations e
+        JOIN runs r ON r.id = e.run_id
+        WHERE e.eval_type = 'dqi'
+          AND r.started_at >= ? AND r.started_at <= ?
+    """, (window_start, window_end)).fetchall()
+
+    if not rows:
+        print(f"No DQI data in the last {days} days.")
+        if owns_conn:
+            conn.close()
+        return
+
+    scores = [r["score"] for r in rows]
+    costs = [r["cost_usd"] for r in rows if r["cost_usd"] is not None]
+    completed = sum(1 for r in rows if r["status"] == "completed")
+
+    components = {"completion": [], "quality": [], "efficiency": [], "cost_score": []}
+    for r in rows:
+        cats = r["categories"]
+        if cats:
+            if isinstance(cats, str):
+                cats = json.loads(cats)
+            for k in components:
+                if k in cats:
+                    components[k].append(cats[k])
+
+    by_ws = {}
+    for r in rows:
+        ws = r["workspace"] or "unknown"
+        by_ws.setdefault(ws, []).append(r["score"])
+
+    by_tt = {}
+    for r in rows:
+        tt = r["task_type"] or "unknown"
+        by_tt.setdefault(tt, []).append(r["score"])
+
+    metrics = {
+        "avg_dqi": round(mean(scores), 4),
+        "median_dqi": round(median(scores), 4),
+        "min_dqi": round(min(scores), 4),
+        "max_dqi": round(max(scores), 4),
+        "completion_rate": round(completed / len(rows), 4),
+        "avg_cost": round(mean(costs), 4) if costs else 0,
+        "run_count": len(rows),
+        "avg_completion": round(mean(components["completion"]), 4) if components["completion"] else 0,
+        "avg_quality": round(mean(components["quality"]), 4) if components["quality"] else 0,
+        "avg_efficiency": round(mean(components["efficiency"]), 4) if components["efficiency"] else 0,
+        "avg_cost_score": round(mean(components["cost_score"]), 4) if components["cost_score"] else 0,
+        "by_workspace": {k: round(mean(v), 4) for k, v in by_ws.items()},
+        "by_task_type": {k: round(mean(v), 4) for k, v in by_tt.items()},
+    }
+
+    conn.execute("""
+        INSERT INTO baselines (name, description, window_start, window_end, run_count, metrics)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (name, description, window_start, window_end, len(rows), json.dumps(metrics)))
+    conn.commit()
+
+    if owns_conn:
+        conn.close()
+
+    print(f"\n=== Baseline: {name} ===")
+    print(f"Window: {days} days ({len(rows)} runs)")
+    print(f"DQI:  avg={metrics['avg_dqi']:.3f}  median={metrics['median_dqi']:.3f}  "
+          f"min={metrics['min_dqi']:.3f}  max={metrics['max_dqi']:.3f}")
+    print(f"Components:  completion={metrics['avg_completion']:.3f}  quality={metrics['avg_quality']:.3f}  "
+          f"efficiency={metrics['avg_efficiency']:.3f}  cost={metrics['avg_cost_score']:.3f}")
+    print(f"Completion rate: {metrics['completion_rate']:.1%}  Avg cost: ${metrics['avg_cost']:.2f}")
+    print(f"\nBy workspace:")
+    for ws, avg in sorted(metrics["by_workspace"].items(), key=lambda x: -x[1]):
+        print(f"  {ws:25} {avg:.3f}")
+    print(f"\nBy task type:")
+    for tt, avg in sorted(metrics["by_task_type"].items(), key=lambda x: -x[1]):
+        print(f"  {tt:25} {avg:.3f}")
+
+
+def register_change_legacy(change_name: str, description: str = "",
+                           baseline_name: str = "", conn=None):
+    """Legacy: Register a system change using raw SQL."""
+    owns_conn = conn is None
+    if owns_conn:
+        from qualito.core.db import get_db
+        conn = get_db()
+
+    baseline = None
+    if baseline_name:
+        baseline = conn.execute(
+            "SELECT * FROM baselines WHERE name = ? ORDER BY created_at DESC LIMIT 1",
+            (baseline_name,),
+        ).fetchone()
+    else:
+        baseline = conn.execute(
+            "SELECT * FROM baselines ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+
+    if not baseline:
+        print("No baseline found. Take a baseline first.")
+        if owns_conn:
+            conn.close()
+        return
+
+    conn.execute("""
+        INSERT INTO system_changes (change_name, description, baseline_id, implemented_at, before_metrics)
+        VALUES (?, ?, ?, ?, ?)
+    """, (change_name, description, baseline["id"],
+          datetime.now(timezone.utc).isoformat(), baseline["metrics"]))
+    conn.commit()
+
+    if owns_conn:
+        conn.close()
+    print(f"Registered change '{change_name}' against baseline '{baseline['name']}'")
+
+
+def evaluate_change_legacy(change_name: str, conn=None):
+    """Legacy: Bayesian before/after comparison using raw SQL."""
+    owns_conn = conn is None
+    if owns_conn:
+        from qualito.core.db import get_db
+        conn = get_db()
+
+    change = conn.execute(
+        "SELECT * FROM system_changes WHERE change_name = ?", (change_name,)
+    ).fetchone()
+    if not change:
+        print(f"Change '{change_name}' not found.")
+        if owns_conn:
+            conn.close()
+        return
+
+    before_metrics = json.loads(change["before_metrics"])
+
+    after_rows = conn.execute("""
+        SELECT e.score FROM evaluations e
+        JOIN runs r ON r.id = e.run_id
+        WHERE e.eval_type = 'dqi' AND r.started_at >= ?
+    """, (change["implemented_at"],)).fetchall()
+
+    if len(after_rows) < 5:
+        print(f"Only {len(after_rows)} runs since change. Need at least 5 for meaningful comparison.")
+        if owns_conn:
+            conn.close()
+        return
+
+    after_scores = [r["score"] for r in after_rows]
+    before_mean = before_metrics["avg_dqi"]
+    before_n = before_metrics["run_count"]
+    after_mean = mean(after_scores)
+    after_n = len(after_scores)
+
+    before_alpha = before_n * before_mean + 1
+    before_beta = before_n * (1 - before_mean) + 1
+    after_alpha = after_n * after_mean + 1
+    after_beta = after_n * (1 - after_mean) + 1
+
+    before_samples = _beta_samples(before_alpha, before_beta)
+    after_samples = _beta_samples(after_alpha, after_beta)
+
+    p_improvement = sum(1 for a, b in zip(after_samples, before_samples) if a > b) / len(after_samples)
+    diff_samples = [a - b for a, b in zip(after_samples, before_samples)]
+    effect_size = after_mean - before_mean
+    hdi_low = _percentile(diff_samples, 2.5)
+    hdi_high = _percentile(diff_samples, 97.5)
+
+    if p_improvement > 0.95 and hdi_low > 0:
+        verdict = "IMPROVED"
+    elif p_improvement < 0.50:
+        verdict = "DEGRADED"
+    else:
+        verdict = "INCONCLUSIVE"
+
+    conn.execute("""
+        UPDATE system_changes
+        SET status = ?, after_metrics = ?, p_improvement = ?, effect_size = ?
+        WHERE change_name = ?
+    """, (verdict.lower(), json.dumps({"avg_dqi": round(after_mean, 4), "run_count": after_n}),
+          round(p_improvement, 4), round(effect_size, 4), change_name))
+    conn.commit()
+
+    if owns_conn:
+        conn.close()
+
+    print(f"\n=== Change Evaluation: {change_name} ===")
+    print(f"Before: DQI={before_mean:.3f} (n={before_n})")
+    print(f"After:  DQI={after_mean:.3f} (n={after_n})")
+    print(f"P(improvement): {p_improvement:.3f}")
+    print(f"Effect size: {effect_size:+.4f}")
+    print(f"95% HDI: [{hdi_low:+.4f}, {hdi_high:+.4f}]")
+    print(f"Verdict: {verdict}")
+
+
+def monitor_legacy(conn=None):
+    """Legacy: CUSUM + EWMA monitoring using raw SQL."""
+    owns_conn = conn is None
+    if owns_conn:
+        from qualito.core.db import get_db
+        conn = get_db()
+
+    rows = conn.execute("""
+        SELECT e.score, r.started_at, r.id FROM evaluations e
+        JOIN runs r ON r.id = e.run_id
+        WHERE e.eval_type = 'dqi'
+        ORDER BY r.started_at DESC LIMIT 200
+    """).fetchall()
+
+    if owns_conn:
+        conn.close()
+
+    if len(rows) < 10:
+        print("Need at least 10 DQI scores for monitoring.")
+        return
+
+    scores = [r["score"] for r in reversed(rows)]
+    target = mean(scores[:50]) if len(scores) >= 50 else mean(scores)
+
+    k, h = 0.03, 0.4
+    s_pos = s_neg = 0
+    alarms = []
+    for i, score in enumerate(scores):
+        s_pos = max(0, s_pos + (score - target - k))
+        s_neg = max(0, s_neg + (target - k - score))
+        if s_neg > h:
+            alarms.append({"index": i, "type": "degradation", "cusum": round(s_neg, 3)})
+            s_neg = 0
+        if s_pos > h:
+            alarms.append({"index": i, "type": "improvement", "cusum": round(s_pos, 3)})
+            s_pos = 0
+
+    ewma = scores[0]
+    lam = 0.1
+    for s in scores:
+        ewma = lam * s + (1 - lam) * ewma
+
+    last_7d = scores[-126:] if len(scores) >= 126 else scores
+    last_1d = scores[-18:] if len(scores) >= 18 else scores
+
+    print(f"\n=== DQI Monitor ===")
+    print(f"Target DQI (baseline): {target:.3f}")
+    print(f"Current EWMA:          {ewma:.3f}")
+    print(f"Last 7 days avg:       {mean(last_7d):.3f} (n={len(last_7d)})")
+    print(f"Last 1 day avg:        {mean(last_1d):.3f} (n={len(last_1d)})")
+    print(f"Total scored runs:     {len(scores)}")
+
+    if alarms:
+        print(f"\nAlarms ({len(alarms)} total, showing last 5):")
+        for a in alarms[-5:]:
+            print(f"  {a['type']:12} at run index {a['index']} (CUSUM={a['cusum']})")
+    else:
+        print("\nNo alarms — system stable")
+
+
+def show_status_legacy(conn=None):
+    """Legacy: Show baselines and changes using raw SQL."""
     owns_conn = conn is None
     if owns_conn:
         from qualito.core.db import get_db

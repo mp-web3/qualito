@@ -20,13 +20,17 @@ from sqlalchemy import (
     MetaData,
     String,
     Table,
+    and_,
+    case,
     create_engine,
     func,
+    or_,
+    select,
 )
 from sqlalchemy import false as sa_false
 
 # ---------------------------------------------------------------------------
-# SQLAlchemy Core table definitions (Phase 1 — PostgreSQL migration)
+# SQLAlchemy Core table definitions (Phase 1 -- PostgreSQL migration)
 # ---------------------------------------------------------------------------
 
 metadata = MetaData()
@@ -298,14 +302,398 @@ def init_db(engine=None):
 
 
 def get_sa_connection(engine=None):
-    """Get a SQLAlchemy connection."""
+    """Get a SQLAlchemy connection with tables created."""
     if engine is None:
         engine = get_engine()
+    init_db(engine)
     return engine.connect()
 
 
 # ---------------------------------------------------------------------------
-# Legacy SQLite schema + raw-SQL functions (unchanged — will migrate in Phase 2+)
+# SQLAlchemy Core CRUD functions (Phase 2)
+#
+# Each function uses a bridge pattern: if the caller passes a sqlite3.Connection
+# (from Phase 3-4 code not yet migrated), it delegates to the _legacy version.
+# SA Connection callers get the SA Core path.
+# ---------------------------------------------------------------------------
+
+
+def insert_run(conn, run: dict):
+    """Insert a run record."""
+    if isinstance(conn, sqlite3.Connection):
+        return insert_run_legacy(conn, run)
+    conn.execute(
+        runs_table.insert().values(
+            id=run["id"],
+            workspace=run["workspace"],
+            task=run["task"],
+            task_type=run.get("task_type"),
+            model=run.get("model"),
+            pipeline_mode=run.get("pipeline_mode", "single"),
+            status=run.get("status", "running"),
+            prompt=run.get("prompt"),
+            original_prompt=run.get("original_prompt"),
+            started_at=run["started_at"],
+            skill_name=run.get("skill_name"),
+            prompt_components=run.get("prompt_components"),
+        )
+    )
+    conn.commit()
+
+
+def update_run(conn, run_id: str, **fields):
+    """Update run fields by name."""
+    if isinstance(conn, sqlite3.Connection):
+        return update_run_legacy(conn, run_id, **fields)
+    if not fields:
+        return
+    conn.execute(
+        runs_table.update().where(runs_table.c.id == run_id).values(**fields)
+    )
+    conn.commit()
+
+
+def insert_tool_calls(conn, run_id: str, tool_calls: list):
+    """Insert tool call records from parsed stream."""
+    if isinstance(conn, sqlite3.Connection):
+        return insert_tool_calls_legacy(conn, run_id, tool_calls)
+    for tc in tool_calls:
+        conn.execute(
+            tool_calls_table.insert().values(
+                run_id=run_id,
+                tool_name=tc.tool_name,
+                arguments_summary=tc.arguments_summary,
+                result_summary=tc.result_summary,
+                is_error=getattr(tc, "is_error", False),
+                phase=tc.phase,
+                timestamp=tc.timestamp,
+                duration_ms=tc.duration_ms,
+            )
+        )
+    conn.commit()
+
+
+def insert_file_activity(conn, run_id: str, file_activity: list):
+    """Insert file activity records from parsed stream."""
+    if isinstance(conn, sqlite3.Connection):
+        return insert_file_activity_legacy(conn, run_id, file_activity)
+    for fa in file_activity:
+        conn.execute(
+            file_activity_table.insert().values(
+                run_id=run_id,
+                file_path=fa.file_path,
+                action=fa.action,
+                timestamp=fa.timestamp,
+            )
+        )
+    conn.commit()
+
+
+def insert_evaluation(conn, run_id: str, eval_type: str,
+                      checks: dict | None = None, score: float | None = None,
+                      categories: dict | None = None, notes: str | None = None):
+    """Insert an evaluation record."""
+    if isinstance(conn, sqlite3.Connection):
+        return insert_evaluation_legacy(conn, run_id, eval_type,
+                                        checks=checks, score=score,
+                                        categories=categories, notes=notes)
+    conn.execute(
+        evaluations_table.insert().values(
+            run_id=run_id,
+            eval_type=eval_type,
+            checks=json.dumps(checks) if checks else None,
+            score=score,
+            categories=json.dumps(categories) if categories else None,
+            notes=notes,
+        )
+    )
+    conn.commit()
+
+
+def insert_artifact(conn, artifact: dict):
+    """Insert an artifact record."""
+    if isinstance(conn, sqlite3.Connection):
+        return insert_artifact_legacy(conn, artifact)
+    conn.execute(
+        artifacts_table.insert().values(**{
+            "id": artifact["id"],
+            "run_id": artifact["run_id"],
+            "artifact_type": artifact["artifact_type"],
+            "title": artifact["title"],
+            "content": artifact.get("content"),
+            "content_type": artifact.get("content_type", "text/markdown"),
+            "file_path": artifact.get("file_path"),
+            "metadata": artifact.get("metadata"),
+            "phase": artifact.get("phase"),
+            "workspace": artifact.get("workspace"),
+        })
+    )
+    conn.commit()
+
+
+def get_artifacts(conn, run_id: str | None = None,
+                  artifact_type: str | None = None, workspace: str | None = None,
+                  q: str | None = None, limit: int = 50) -> list[dict]:
+    """Query artifacts with optional filters."""
+    if isinstance(conn, sqlite3.Connection):
+        return get_artifacts_legacy(conn, run_id=run_id, artifact_type=artifact_type,
+                                    workspace=workspace, q=q, limit=limit)
+    conditions = []
+    if run_id:
+        conditions.append(artifacts_table.c.run_id == run_id)
+    if artifact_type:
+        conditions.append(artifacts_table.c.artifact_type == artifact_type)
+    if workspace:
+        conditions.append(artifacts_table.c.workspace == workspace)
+    if q:
+        conditions.append(
+            or_(
+                artifacts_table.c.title.ilike(f"%{q}%"),
+                artifacts_table.c.content.ilike(f"%{q}%"),
+            )
+        )
+    stmt = select(artifacts_table)
+    if conditions:
+        stmt = stmt.where(and_(*conditions))
+    stmt = stmt.order_by(artifacts_table.c.created_at.desc()).limit(limit)
+    rows = conn.execute(stmt).mappings().fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_run(conn, run_id: str) -> dict | None:
+    """Get a single run with all related data."""
+    if isinstance(conn, sqlite3.Connection):
+        return get_run_legacy(conn, run_id)
+    row = conn.execute(
+        select(runs_table).where(runs_table.c.id == run_id)
+    ).mappings().fetchone()
+    if not row:
+        return None
+    run = dict(row)
+
+    tcs = conn.execute(
+        select(tool_calls_table)
+        .where(tool_calls_table.c.run_id == run_id)
+        .order_by(tool_calls_table.c.id)
+    ).mappings().fetchall()
+    run["tool_calls"] = [dict(r) for r in tcs]
+
+    fas = conn.execute(
+        select(file_activity_table)
+        .where(file_activity_table.c.run_id == run_id)
+        .order_by(file_activity_table.c.id)
+    ).mappings().fetchall()
+    run["file_activity"] = [dict(r) for r in fas]
+
+    evals = conn.execute(
+        select(evaluations_table)
+        .where(evaluations_table.c.run_id == run_id)
+        .order_by(evaluations_table.c.id)
+    ).mappings().fetchall()
+    run["evaluations"] = [dict(r) for r in evals]
+
+    return run
+
+
+def get_metrics(conn, workspace: str | None = None,
+                task_type: str | None = None, since: str | None = None) -> dict:
+    """Compute aggregate metrics with optional filters."""
+    if isinstance(conn, sqlite3.Connection):
+        return get_metrics_legacy(conn, workspace=workspace,
+                                  task_type=task_type, since=since)
+    conditions = []
+    if workspace:
+        conditions.append(runs_table.c.workspace == workspace)
+    if task_type:
+        conditions.append(runs_table.c.task_type == task_type)
+    if since:
+        conditions.append(runs_table.c.started_at >= since)
+
+    # Overall stats
+    stmt = select(
+        func.count().label("total"),
+        func.sum(case((runs_table.c.status == "completed", 1), else_=0)).label("completed"),
+        func.sum(case((runs_table.c.status == "failed", 1), else_=0)).label("failed"),
+        func.avg(runs_table.c.cost_usd).label("avg_cost"),
+        func.sum(runs_table.c.cost_usd).label("total_cost"),
+        func.avg(runs_table.c.duration_ms).label("avg_duration"),
+    ).select_from(runs_table)
+    if conditions:
+        stmt = stmt.where(and_(*conditions))
+    row = conn.execute(stmt).mappings().fetchone()
+
+    # Average eval score
+    eval_conditions = [evaluations_table.c.eval_type == "auto"]
+    if workspace:
+        eval_conditions.append(runs_table.c.workspace == workspace)
+    if task_type:
+        eval_conditions.append(runs_table.c.task_type == task_type)
+    if since:
+        eval_conditions.append(runs_table.c.started_at >= since)
+
+    eval_stmt = (
+        select(func.avg(evaluations_table.c.score).label("avg_score"))
+        .select_from(
+            evaluations_table.join(runs_table, evaluations_table.c.run_id == runs_table.c.id)
+        )
+        .where(and_(*eval_conditions))
+    )
+    eval_row = conn.execute(eval_stmt).mappings().fetchone()
+
+    # By task type
+    type_stmt = select(
+        runs_table.c.task_type,
+        func.count().label("count"),
+        func.sum(case((runs_table.c.status == "completed", 1), else_=0)).label("ok"),
+        func.avg(runs_table.c.cost_usd).label("avg_cost"),
+        func.sum(runs_table.c.cost_usd).label("total_cost"),
+    ).select_from(runs_table)
+    if conditions:
+        type_stmt = type_stmt.where(and_(*conditions))
+    type_stmt = type_stmt.group_by(runs_table.c.task_type).order_by(func.count().desc())
+    type_rows = conn.execute(type_stmt).mappings().fetchall()
+
+    # By workspace
+    ws_stmt = select(
+        runs_table.c.workspace,
+        func.count().label("count"),
+        func.sum(case((runs_table.c.status == "completed", 1), else_=0)).label("ok"),
+        func.sum(runs_table.c.cost_usd).label("total_cost"),
+    ).select_from(runs_table)
+    if conditions:
+        ws_stmt = ws_stmt.where(and_(*conditions))
+    ws_stmt = ws_stmt.group_by(runs_table.c.workspace).order_by(func.count().desc())
+    ws_rows = conn.execute(ws_stmt).mappings().fetchall()
+
+    return {
+        "total": dict(row),
+        "avg_score": eval_row["avg_score"] if eval_row else None,
+        "by_task_type": [dict(r) for r in type_rows],
+        "by_workspace": [dict(r) for r in ws_rows],
+    }
+
+
+# --- Incident CRUD ---
+
+
+def insert_incident(conn, incident: dict) -> int:
+    """Insert an incident record. Returns the new incident id."""
+    if isinstance(conn, sqlite3.Connection):
+        return insert_incident_legacy(conn, incident)
+    cols = [
+        "incident_key", "category", "severity", "status", "workspace",
+        "task_type", "title", "description", "detection_method",
+        "trigger_metric", "trigger_value", "baseline_value", "burn_rate",
+        "affected_run_ids", "total_affected_runs", "cost_impact_usd",
+        "fix_experiment_id", "fix_description", "resolution_type",
+        "confirmed_at", "resolved_at", "time_to_detect_runs",
+        "time_to_resolve_runs",
+    ]
+    values = {}
+    for c in cols:
+        if c in incident:
+            v = incident[c]
+            if c == "affected_run_ids" and isinstance(v, list):
+                v = json.dumps(v)
+            values[c] = v
+    result = conn.execute(incidents_table.insert().values(**values))
+    conn.commit()
+    return result.inserted_primary_key[0]
+
+
+def update_incident(conn, incident_id: int, **fields):
+    """Update incident fields by name."""
+    if isinstance(conn, sqlite3.Connection):
+        return update_incident_legacy(conn, incident_id, **fields)
+    if not fields:
+        return
+    if "affected_run_ids" in fields and isinstance(fields["affected_run_ids"], list):
+        fields["affected_run_ids"] = json.dumps(fields["affected_run_ids"])
+    conn.execute(
+        incidents_table.update()
+        .where(incidents_table.c.id == incident_id)
+        .values(**fields)
+    )
+    conn.commit()
+
+
+def insert_incident_event(conn, incident_id: int,
+                          event_type: str, old_status: str | None = None,
+                          new_status: str | None = None,
+                          data: dict | None = None):
+    """Insert an incident event record."""
+    if isinstance(conn, sqlite3.Connection):
+        return insert_incident_event_legacy(conn, incident_id, event_type,
+                                            old_status=old_status,
+                                            new_status=new_status, data=data)
+    conn.execute(
+        incident_events_table.insert().values(
+            incident_id=incident_id,
+            event_type=event_type,
+            old_status=old_status,
+            new_status=new_status,
+            data=json.dumps(data) if data else None,
+        )
+    )
+    conn.commit()
+
+
+def get_incident(conn, incident_id: int) -> dict | None:
+    """Get a single incident with all events attached."""
+    if isinstance(conn, sqlite3.Connection):
+        return get_incident_legacy(conn, incident_id)
+    row = conn.execute(
+        select(incidents_table).where(incidents_table.c.id == incident_id)
+    ).mappings().fetchone()
+    if not row:
+        return None
+    incident = dict(row)
+
+    events = conn.execute(
+        select(incident_events_table)
+        .where(incident_events_table.c.incident_id == incident_id)
+        .order_by(incident_events_table.c.id)
+    ).mappings().fetchall()
+    incident["events"] = [dict(r) for r in events]
+
+    return incident
+
+
+def get_incidents(conn, workspace: str | None = None,
+                  status: str | None = None, category: str | None = None,
+                  severity: str | None = None, since: str | None = None,
+                  limit: int = 50) -> list[dict]:
+    """Query incidents with optional filters."""
+    if isinstance(conn, sqlite3.Connection):
+        return get_incidents_legacy(conn, workspace=workspace, status=status,
+                                    category=category, severity=severity,
+                                    since=since, limit=limit)
+    conditions = []
+    if workspace:
+        conditions.append(incidents_table.c.workspace == workspace)
+    if status:
+        conditions.append(incidents_table.c.status == status)
+    if category:
+        conditions.append(incidents_table.c.category == category)
+    if severity:
+        conditions.append(incidents_table.c.severity == severity)
+    if since:
+        conditions.append(incidents_table.c.created_at >= since)
+
+    stmt = select(incidents_table)
+    if conditions:
+        stmt = stmt.where(and_(*conditions))
+    stmt = stmt.order_by(incidents_table.c.created_at.desc()).limit(limit)
+
+    rows = conn.execute(stmt).mappings().fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Legacy SQLite schema + raw-SQL functions (renamed with _legacy suffix)
+# These are preserved for callers not yet migrated (Phase 3-4: dashboard,
+# cli, mcp, importer, evaluator, dqi). Bridge functions above delegate to
+# these when passed a sqlite3.Connection.
 # ---------------------------------------------------------------------------
 
 SCHEMA = """
@@ -534,8 +922,8 @@ def get_db(db_path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
-def insert_run(conn: sqlite3.Connection, run: dict):
-    """Insert a run record."""
+def insert_run_legacy(conn: sqlite3.Connection, run: dict):
+    """Legacy: Insert a run record using raw SQL."""
     conn.execute(
         """INSERT INTO runs (id, workspace, task, task_type, model, pipeline_mode,
            status, prompt, original_prompt, started_at, skill_name, prompt_components)
@@ -551,8 +939,8 @@ def insert_run(conn: sqlite3.Connection, run: dict):
     conn.commit()
 
 
-def update_run(conn: sqlite3.Connection, run_id: str, **fields):
-    """Update run fields by name."""
+def update_run_legacy(conn: sqlite3.Connection, run_id: str, **fields):
+    """Legacy: Update run fields by name using raw SQL."""
     if not fields:
         return
     set_clause = ", ".join(f"{k} = ?" for k in fields)
@@ -562,8 +950,8 @@ def update_run(conn: sqlite3.Connection, run_id: str, **fields):
     conn.commit()
 
 
-def insert_tool_calls(conn: sqlite3.Connection, run_id: str, tool_calls: list):
-    """Insert tool call records from parsed stream."""
+def insert_tool_calls_legacy(conn: sqlite3.Connection, run_id: str, tool_calls: list):
+    """Legacy: Insert tool call records using raw SQL."""
     for tc in tool_calls:
         conn.execute(
             """INSERT INTO tool_calls (run_id, tool_name, arguments_summary,
@@ -578,8 +966,8 @@ def insert_tool_calls(conn: sqlite3.Connection, run_id: str, tool_calls: list):
     conn.commit()
 
 
-def insert_file_activity(conn: sqlite3.Connection, run_id: str, file_activity: list):
-    """Insert file activity records from parsed stream."""
+def insert_file_activity_legacy(conn: sqlite3.Connection, run_id: str, file_activity: list):
+    """Legacy: Insert file activity records using raw SQL."""
     for fa in file_activity:
         conn.execute(
             """INSERT INTO file_activity (run_id, file_path, action, timestamp)
@@ -589,10 +977,10 @@ def insert_file_activity(conn: sqlite3.Connection, run_id: str, file_activity: l
     conn.commit()
 
 
-def insert_evaluation(conn: sqlite3.Connection, run_id: str, eval_type: str,
-                      checks: dict | None = None, score: float | None = None,
-                      categories: dict | None = None, notes: str | None = None):
-    """Insert an evaluation record."""
+def insert_evaluation_legacy(conn: sqlite3.Connection, run_id: str, eval_type: str,
+                             checks: dict | None = None, score: float | None = None,
+                             categories: dict | None = None, notes: str | None = None):
+    """Legacy: Insert an evaluation record using raw SQL."""
     conn.execute(
         """INSERT INTO evaluations (run_id, eval_type, checks, score, categories, notes)
            VALUES (?, ?, ?, ?, ?, ?)""",
@@ -607,8 +995,8 @@ def insert_evaluation(conn: sqlite3.Connection, run_id: str, eval_type: str,
     conn.commit()
 
 
-def insert_artifact(conn: sqlite3.Connection, artifact: dict):
-    """Insert an artifact record."""
+def insert_artifact_legacy(conn: sqlite3.Connection, artifact: dict):
+    """Legacy: Insert an artifact record using raw SQL."""
     conn.execute(
         """INSERT INTO artifacts (id, run_id, artifact_type, title, content,
            content_type, file_path, metadata, phase, workspace)
@@ -624,10 +1012,10 @@ def insert_artifact(conn: sqlite3.Connection, artifact: dict):
     conn.commit()
 
 
-def get_artifacts(conn: sqlite3.Connection, run_id: str | None = None,
-                  artifact_type: str | None = None, workspace: str | None = None,
-                  q: str | None = None, limit: int = 50) -> list[dict]:
-    """Query artifacts with optional filters."""
+def get_artifacts_legacy(conn: sqlite3.Connection, run_id: str | None = None,
+                         artifact_type: str | None = None, workspace: str | None = None,
+                         q: str | None = None, limit: int = 50) -> list[dict]:
+    """Legacy: Query artifacts with optional filters using raw SQL."""
     where_parts = []
     params = []
     if run_id:
@@ -653,26 +1041,23 @@ def get_artifacts(conn: sqlite3.Connection, run_id: str | None = None,
     return [dict(r) for r in rows]
 
 
-def get_run(conn: sqlite3.Connection, run_id: str) -> dict | None:
-    """Get a single run with all related data."""
+def get_run_legacy(conn: sqlite3.Connection, run_id: str) -> dict | None:
+    """Legacy: Get a single run with all related data using raw SQL."""
     row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
     if not row:
         return None
     run = dict(row)
 
-    # Attach tool calls
     tcs = conn.execute(
         "SELECT * FROM tool_calls WHERE run_id = ? ORDER BY id", (run_id,)
     ).fetchall()
     run["tool_calls"] = [dict(r) for r in tcs]
 
-    # Attach file activity
     fas = conn.execute(
         "SELECT * FROM file_activity WHERE run_id = ? ORDER BY id", (run_id,)
     ).fetchall()
     run["file_activity"] = [dict(r) for r in fas]
 
-    # Attach evaluations
     evals = conn.execute(
         "SELECT * FROM evaluations WHERE run_id = ? ORDER BY id", (run_id,)
     ).fetchall()
@@ -681,9 +1066,9 @@ def get_run(conn: sqlite3.Connection, run_id: str) -> dict | None:
     return run
 
 
-def get_metrics(conn: sqlite3.Connection, workspace: str | None = None,
-                task_type: str | None = None, since: str | None = None) -> dict:
-    """Compute aggregate metrics with optional filters."""
+def get_metrics_legacy(conn: sqlite3.Connection, workspace: str | None = None,
+                       task_type: str | None = None, since: str | None = None) -> dict:
+    """Legacy: Compute aggregate metrics using raw SQL."""
     where_parts = []
     params = []
     if workspace:
@@ -698,7 +1083,6 @@ def get_metrics(conn: sqlite3.Connection, workspace: str | None = None,
 
     where = "WHERE " + " AND ".join(where_parts) if where_parts else ""
 
-    # Overall stats
     row = conn.execute(f"""
         SELECT
             COUNT(*) as total,
@@ -710,16 +1094,14 @@ def get_metrics(conn: sqlite3.Connection, workspace: str | None = None,
         FROM runs {where}
     """, params).fetchone()
 
-    # Average eval score
     eval_row = conn.execute(f"""
         SELECT AVG(e.score) as avg_score
         FROM evaluations e
         JOIN runs r ON r.id = e.run_id
         {where.replace('workspace', 'r.workspace').replace('task_type', 'r.task_type').replace('started_at', 'r.started_at')}
-        AND e.eval_type = 'auto'
+        {"AND" if where else "WHERE"} e.eval_type = 'auto'
     """, params).fetchone()
 
-    # By task type
     type_rows = conn.execute(f"""
         SELECT task_type,
             COUNT(*) as count,
@@ -731,7 +1113,6 @@ def get_metrics(conn: sqlite3.Connection, workspace: str | None = None,
         ORDER BY count DESC
     """, params).fetchall()
 
-    # By workspace
     ws_rows = conn.execute(f"""
         SELECT workspace,
             COUNT(*) as count,
@@ -750,11 +1131,11 @@ def get_metrics(conn: sqlite3.Connection, workspace: str | None = None,
     }
 
 
-# --- Incident CRUD ---
+# --- Legacy Incident CRUD ---
 
 
-def insert_incident(conn: sqlite3.Connection, incident: dict) -> int:
-    """Insert an incident record. Returns the new incident id."""
+def insert_incident_legacy(conn: sqlite3.Connection, incident: dict) -> int:
+    """Legacy: Insert an incident record using raw SQL."""
     cols = [
         "incident_key", "category", "severity", "status", "workspace",
         "task_type", "title", "description", "detection_method",
@@ -781,8 +1162,8 @@ def insert_incident(conn: sqlite3.Connection, incident: dict) -> int:
     return cur.lastrowid
 
 
-def update_incident(conn: sqlite3.Connection, incident_id: int, **fields):
-    """Update incident fields by name."""
+def update_incident_legacy(conn: sqlite3.Connection, incident_id: int, **fields):
+    """Legacy: Update incident fields using raw SQL."""
     if not fields:
         return
     if "affected_run_ids" in fields and isinstance(fields["affected_run_ids"], list):
@@ -794,11 +1175,11 @@ def update_incident(conn: sqlite3.Connection, incident_id: int, **fields):
     conn.commit()
 
 
-def insert_incident_event(conn: sqlite3.Connection, incident_id: int,
-                          event_type: str, old_status: str | None = None,
-                          new_status: str | None = None,
-                          data: dict | None = None):
-    """Insert an incident event record."""
+def insert_incident_event_legacy(conn: sqlite3.Connection, incident_id: int,
+                                 event_type: str, old_status: str | None = None,
+                                 new_status: str | None = None,
+                                 data: dict | None = None):
+    """Legacy: Insert an incident event record using raw SQL."""
     conn.execute(
         """INSERT INTO incident_events (incident_id, event_type, old_status,
            new_status, data) VALUES (?, ?, ?, ?, ?)""",
@@ -810,8 +1191,8 @@ def insert_incident_event(conn: sqlite3.Connection, incident_id: int,
     conn.commit()
 
 
-def get_incident(conn: sqlite3.Connection, incident_id: int) -> dict | None:
-    """Get a single incident with all events attached."""
+def get_incident_legacy(conn: sqlite3.Connection, incident_id: int) -> dict | None:
+    """Legacy: Get a single incident with all events using raw SQL."""
     row = conn.execute(
         "SELECT * FROM incidents WHERE id = ?", (incident_id,)
     ).fetchone()
@@ -819,7 +1200,6 @@ def get_incident(conn: sqlite3.Connection, incident_id: int) -> dict | None:
         return None
     incident = dict(row)
 
-    # Attach events
     events = conn.execute(
         "SELECT * FROM incident_events WHERE incident_id = ? ORDER BY id",
         (incident_id,),
@@ -829,11 +1209,11 @@ def get_incident(conn: sqlite3.Connection, incident_id: int) -> dict | None:
     return incident
 
 
-def get_incidents(conn: sqlite3.Connection, workspace: str | None = None,
-                  status: str | None = None, category: str | None = None,
-                  severity: str | None = None, since: str | None = None,
-                  limit: int = 50) -> list[dict]:
-    """Query incidents with optional filters."""
+def get_incidents_legacy(conn: sqlite3.Connection, workspace: str | None = None,
+                         status: str | None = None, category: str | None = None,
+                         severity: str | None = None, since: str | None = None,
+                         limit: int = 50) -> list[dict]:
+    """Legacy: Query incidents with optional filters using raw SQL."""
     where_parts = []
     params = []
     if workspace:
