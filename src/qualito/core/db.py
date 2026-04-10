@@ -310,6 +310,8 @@ email_logs_table = Table(
     Column("provider_id", String),
     Column("error_message", String),
     Column("sent_at", String, server_default=func.now()),
+    Column("delivery_status", String),
+    Column("delivery_updated_at", String),
 )
 
 setup_tokens_table = Table(
