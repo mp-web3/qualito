@@ -51,7 +51,7 @@ qualito sync
 # → https://app.qualito.ai
 ```
 
-**Free tier:** 100 runs/month, 1 workspace. **Pro ($29/mo):** unlimited.
+**Free tier:** 100 runs/month, 3 workspaces. **Pro ($29/mo):** unlimited.
 
 ## CLI Commands
 

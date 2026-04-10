@@ -112,13 +112,14 @@ def _collect_run_data(conn, run_id: str) -> dict:
     return get_run(conn, run_id) or {}
 
 
-def sync_runs(conn, since: str | None = None) -> dict:
+def sync_runs(conn, since: str | None = None, workspaces: list[str] | None = None) -> dict:
     """Sync local runs to the cloud API.
 
     Args:
         conn: Database connection (SA Connection).
         since: ISO date string — only sync runs started after this date.
                If None, syncs all runs.
+        workspaces: List of workspace names to sync. If None, syncs all workspaces.
 
     Returns:
         dict with keys: synced, skipped, errors.
@@ -126,6 +127,8 @@ def sync_runs(conn, since: str | None = None) -> dict:
     stmt = select(runs_table.c.id).order_by(runs_table.c.started_at)
     if since:
         stmt = stmt.where(runs_table.c.started_at >= since)
+    if workspaces:
+        stmt = stmt.where(runs_table.c.workspace.in_(workspaces))
 
     rows = conn.execute(stmt).mappings().fetchall()
 
