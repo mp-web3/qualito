@@ -23,6 +23,7 @@ from sqlalchemy import (
     func,
     or_,
     select,
+    text,
 )
 from sqlalchemy import false as sa_false
 
@@ -364,10 +365,29 @@ def get_engine(db_url=None):
 
 
 def init_db(engine=None):
-    """Create all tables via SA. Safe to call multiple times."""
+    """Create all tables via SA. Safe to call multiple times.
+
+    Also runs lightweight migrations for columns added after initial
+    table creation (SA create_all won't ALTER existing tables).
+    """
     if engine is None:
         engine = get_engine()
     metadata.create_all(engine)
+
+    # Migrate: add columns that were added after the initial schema.
+    # SQLite doesn't support IF NOT EXISTS on ALTER TABLE, so we
+    # catch the "duplicate column" error and move on.
+    _migrations = [
+        "ALTER TABLE runs ADD COLUMN user_id INTEGER REFERENCES users(id)",
+    ]
+    with engine.connect() as conn:
+        for sql in _migrations:
+            try:
+                conn.execute(text(sql))
+            except Exception:
+                pass  # Column already exists
+        conn.commit()
+
     return engine
 
 
