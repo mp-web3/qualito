@@ -23,12 +23,13 @@ EXPECTED_TABLES = {
     "consent",
     "email_logs",
     "setup_tokens",
+    "conversations",
 }
 
 
-def test_metadata_has_18_tables():
-    """metadata.tables has exactly 18 entries with correct names."""
-    assert len(metadata.tables) == 18
+def test_metadata_has_19_tables():
+    """metadata.tables has exactly 19 entries with correct names."""
+    assert len(metadata.tables) == 19
     assert set(metadata.tables.keys()) == EXPECTED_TABLES
 
 
@@ -88,7 +89,7 @@ def test_init_db_idempotent(tmp_path):
     init_db(engine)  # Should not raise
 
     insp = inspect(engine)
-    assert len(insp.get_table_names()) == 18
+    assert len(insp.get_table_names()) == 19
 
 
 def test_init_db_returns_engine(tmp_path):
@@ -109,7 +110,8 @@ def test_runs_table_columns():
         "prompt", "original_prompt", "started_at", "completed_at",
         "researcher_summary", "implementer_summary", "verifier_verdict",
         "paper_live_gap", "skill_name", "source", "prompt_components",
-        "user_id",
+        "user_id", "session_type", "entrypoint", "claude_version",
+        "session_name", "has_subagents", "subagent_count", "error_count",
     }
     assert cols == expected
 

@@ -63,6 +63,13 @@ runs_table = Table(
     Column("source", String, server_default="delegation"),
     Column("prompt_components", String),
     Column("user_id", Integer, ForeignKey("users.id"), index=True),
+    Column("session_type", String, server_default="unknown"),
+    Column("entrypoint", String),
+    Column("claude_version", String),
+    Column("session_name", String),
+    Column("has_subagents", Boolean, server_default=sa_false()),
+    Column("subagent_count", Integer, server_default="0"),
+    Column("error_count", Integer, server_default="0"),
 )
 
 tool_calls_table = Table(
@@ -326,6 +333,15 @@ setup_tokens_table = Table(
     Column("used", Boolean, server_default=sa_false()),
 )
 
+conversations_table = Table(
+    "conversations",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("run_id", String, ForeignKey("runs.id"), nullable=False, unique=True),
+    Column("messages", String, nullable=False),
+    Column("message_count", Integer),
+)
+
 # ---------------------------------------------------------------------------
 # SQLAlchemy engine helpers
 # ---------------------------------------------------------------------------
@@ -379,6 +395,13 @@ def init_db(engine=None):
     # acquiring exclusive locks that block all queries on the table.
     _migrations = [
         ("runs", "user_id", "ALTER TABLE runs ADD COLUMN user_id INTEGER REFERENCES users(id)"),
+        ("runs", "session_type", "ALTER TABLE runs ADD COLUMN session_type VARCHAR DEFAULT 'unknown'"),
+        ("runs", "entrypoint", "ALTER TABLE runs ADD COLUMN entrypoint VARCHAR"),
+        ("runs", "claude_version", "ALTER TABLE runs ADD COLUMN claude_version VARCHAR"),
+        ("runs", "session_name", "ALTER TABLE runs ADD COLUMN session_name VARCHAR"),
+        ("runs", "has_subagents", "ALTER TABLE runs ADD COLUMN has_subagents BOOLEAN DEFAULT FALSE"),
+        ("runs", "subagent_count", "ALTER TABLE runs ADD COLUMN subagent_count INTEGER DEFAULT 0"),
+        ("runs", "error_count", "ALTER TABLE runs ADD COLUMN error_count INTEGER DEFAULT 0"),
     ]
     with engine.connect() as conn:
         db_url = str(engine.url)
@@ -415,22 +438,29 @@ def get_sa_connection(engine=None):
 
 def insert_run(conn, run: dict):
     """Insert a run record."""
-    conn.execute(
-        runs_table.insert().values(
-            id=run["id"],
-            workspace=run["workspace"],
-            task=run["task"],
-            task_type=run.get("task_type"),
-            model=run.get("model"),
-            pipeline_mode=run.get("pipeline_mode", "single"),
-            status=run.get("status", "running"),
-            prompt=run.get("prompt"),
-            original_prompt=run.get("original_prompt"),
-            started_at=run["started_at"],
-            skill_name=run.get("skill_name"),
-            prompt_components=run.get("prompt_components"),
-        )
-    )
+    values = {
+        "id": run["id"],
+        "workspace": run["workspace"],
+        "task": run["task"],
+        "task_type": run.get("task_type"),
+        "model": run.get("model"),
+        "pipeline_mode": run.get("pipeline_mode", "single"),
+        "status": run.get("status", "running"),
+        "prompt": run.get("prompt"),
+        "original_prompt": run.get("original_prompt"),
+        "started_at": run["started_at"],
+        "skill_name": run.get("skill_name"),
+        "prompt_components": run.get("prompt_components"),
+    }
+    # Optional fields — only include if present
+    for key in (
+        "source", "session_type", "entrypoint", "claude_version",
+        "session_name", "has_subagents", "subagent_count", "error_count",
+        "branch", "files_changed", "user_id",
+    ):
+        if key in run:
+            values[key] = run[key]
+    conn.execute(runs_table.insert().values(**values))
     conn.commit()
 
 
@@ -536,6 +566,31 @@ def get_artifacts(conn, run_id: str | None = None,
     stmt = stmt.order_by(artifacts_table.c.created_at.desc()).limit(limit)
     rows = conn.execute(stmt).mappings().fetchall()
     return [dict(r) for r in rows]
+
+
+def insert_conversation(conn, run_id: str, messages: list[dict]):
+    """Insert a condensed conversation for a run."""
+    conn.execute(
+        conversations_table.insert().values(
+            run_id=run_id,
+            messages=json.dumps(messages),
+            message_count=len(messages),
+        )
+    )
+    conn.commit()
+
+
+def get_conversation(conn, run_id: str) -> dict | None:
+    """Get the stored conversation for a run."""
+    row = conn.execute(
+        select(conversations_table)
+        .where(conversations_table.c.run_id == run_id)
+    ).mappings().fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["messages"] = json.loads(result["messages"]) if result["messages"] else []
+    return result
 
 
 def get_run(conn, run_id: str) -> dict | None:

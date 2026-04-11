@@ -224,20 +224,52 @@ def test_folder_to_display_name_windows():
 # ---------------------------------------------------------------------------
 
 
-def _make_session_jsonl(path: Path, session_id: str, task: str = "test task"):
+def _make_session_jsonl(path: Path, session_id: str, task: str = "This is a test task with enough characters for extraction"):
     """Create a minimal valid session JSONL file."""
     events = [
         {
             "type": "user",
             "timestamp": "2024-01-01T10:00:00Z",
-            "message": {"content": task},
+            "sessionId": session_id,
+            "message": {"role": "user", "content": task},
+        },
+        {
+            "type": "assistant",
+            "timestamp": "2024-01-01T10:00:30Z",
+            "sessionId": session_id,
+            "message": {
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "I'll help you with that task."}],
+                "usage": {"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 0},
+            },
+        },
+        {
+            "type": "assistant",
+            "timestamp": "2024-01-01T10:00:45Z",
+            "sessionId": session_id,
+            "message": {
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "tool_use", "id": "tu_1", "name": "Read", "input": {"file_path": "/tmp/test.py"}}],
+                "usage": {"input_tokens": 50, "output_tokens": 30, "cache_read_input_tokens": 0},
+            },
+        },
+        {
+            "type": "user",
+            "timestamp": "2024-01-01T10:00:50Z",
+            "sessionId": session_id,
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu_1", "content": "file contents"}]},
         },
         {
             "type": "assistant",
             "timestamp": "2024-01-01T10:01:00Z",
+            "sessionId": session_id,
             "message": {
-                "content": [{"type": "tool_use", "name": "Read", "input": {}}],
-                "usage": {"input_tokens": 100, "output_tokens": 50},
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "I've read the file and completed the task."}],
+                "usage": {"input_tokens": 80, "output_tokens": 40, "cache_read_input_tokens": 0},
             },
         },
     ]

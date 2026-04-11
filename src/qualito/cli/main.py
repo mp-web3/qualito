@@ -890,6 +890,58 @@ def import_sessions(project_dir: Path | None, workspace: str | None, all_project
 
 
 # ---------------------------------------------------------------------------
+# qualito reimport
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--dir", "project_dir", type=click.Path(exists=True, path_type=Path),
+              default=None, help="Project directory (default: cwd)")
+def reimport(project_dir: Path | None):
+    """Re-import all sessions with updated extraction logic.
+
+    Deletes existing run records and re-imports from JSONL files
+    using the new session classification and metadata extraction.
+    """
+    if project_dir is None:
+        project_dir = Path.cwd()
+
+    from qualito.config import load_config
+
+    config = load_config(project_dir)
+    db_path = config.db_path
+    if not db_path.is_absolute():
+        db_path = project_dir / db_path
+
+    if not db_path.exists():
+        click.echo("No Qualito database found. Run 'qualito setup' first.")
+        raise SystemExit(1)
+
+    from qualito.importer import reimport_all
+
+    engine = get_engine(str(db_path))
+    conn = get_sa_connection(engine)
+    try:
+        click.echo("Re-importing all sessions with updated extraction...")
+        click.echo("This will delete and re-import all existing run records.\n")
+
+        result = reimport_all(conn)
+
+        imported = result["interactive"] + result["delegated"]
+        click.echo(f"Re-imported {imported} sessions.")
+        click.echo(f"  Interactive: {result['interactive']}")
+        click.echo(f"  Delegated:   {result['delegated']}")
+        click.echo(f"  Skipped (VS Code): {result['skipped_vscode']}")
+        click.echo(f"  Skipped (empty/unknown): {result['skipped_unknown'] + result['skipped_empty']}")
+
+        if imported > 0:
+            summaries = _get_workspace_summary(conn)
+            _display_results_table(summaries)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # dqi score
 # ---------------------------------------------------------------------------
 
