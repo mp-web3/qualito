@@ -375,17 +375,26 @@ def init_db(engine=None):
     metadata.create_all(engine)
 
     # Migrate: add columns that were added after the initial schema.
-    # SQLite doesn't support IF NOT EXISTS on ALTER TABLE, so we
-    # catch the "duplicate column" error and move on.
+    # Check if column exists BEFORE attempting ALTER TABLE to avoid
+    # acquiring exclusive locks that block all queries on the table.
     _migrations = [
-        "ALTER TABLE runs ADD COLUMN user_id INTEGER REFERENCES users(id)",
+        ("runs", "user_id", "ALTER TABLE runs ADD COLUMN user_id INTEGER REFERENCES users(id)"),
     ]
     with engine.connect() as conn:
-        for sql in _migrations:
+        db_url = str(engine.url)
+        is_pg = "postgresql" in db_url or "postgres" in db_url
+        for table_name, col_name, sql in _migrations:
             try:
+                if is_pg:
+                    exists = conn.execute(text(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_name = :t AND column_name = :c"
+                    ), {"t": table_name, "c": col_name}).fetchone()
+                    if exists:
+                        continue
                 conn.execute(text(sql))
             except Exception:
-                pass  # Column already exists
+                pass  # Column already exists (SQLite fallback)
         conn.commit()
 
     return engine
