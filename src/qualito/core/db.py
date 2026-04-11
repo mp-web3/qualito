@@ -70,6 +70,7 @@ runs_table = Table(
     Column("has_subagents", Boolean, server_default=sa_false()),
     Column("subagent_count", Integer, server_default="0"),
     Column("error_count", Integer, server_default="0"),
+    Column("tool_count", Integer, server_default="0"),
 )
 
 tool_calls_table = Table(
@@ -402,6 +403,7 @@ def init_db(engine=None):
         ("runs", "has_subagents", "ALTER TABLE runs ADD COLUMN has_subagents BOOLEAN DEFAULT FALSE"),
         ("runs", "subagent_count", "ALTER TABLE runs ADD COLUMN subagent_count INTEGER DEFAULT 0"),
         ("runs", "error_count", "ALTER TABLE runs ADD COLUMN error_count INTEGER DEFAULT 0"),
+        ("runs", "tool_count", "ALTER TABLE runs ADD COLUMN tool_count INTEGER DEFAULT 0"),
     ]
     with engine.connect() as conn:
         db_url = str(engine.url)
@@ -456,7 +458,7 @@ def insert_run(conn, run: dict):
     for key in (
         "source", "session_type", "entrypoint", "claude_version",
         "session_name", "has_subagents", "subagent_count", "error_count",
-        "branch", "files_changed", "user_id",
+        "tool_count", "branch", "files_changed", "user_id",
     ):
         if key in run:
             values[key] = run[key]

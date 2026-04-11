@@ -518,6 +518,7 @@ def import_session(
         "has_subagents": meta.get("has_subagents", False),
         "subagent_count": meta.get("subagent_count", 0),
         "error_count": meta.get("error_count", 0),
+        "tool_count": meta.get("tool_count", 0),
         "branch": meta.get("git_branch"),
         "files_changed": json.dumps(meta.get("files_summary")) if meta.get("files_summary") else None,
     })
