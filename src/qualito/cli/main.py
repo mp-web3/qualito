@@ -678,7 +678,7 @@ def setup(token):
                 pass  # Non-critical — data is already synced
 
             click.echo(
-                "\nSynced to cloud. Open app.qualito.ai to see your dashboard."
+                "\nSynced to cloud. View your runs at: https://app.qualito.ai/runs"
             )
 
         except Exception:
@@ -686,7 +686,6 @@ def setup(token):
                 "\nCould not connect to cloud. "
                 "Your data is imported locally."
             )
-            _print_next_steps()
     else:
         # Interactive setup
         global_dir = Path.home() / ".qualito"
