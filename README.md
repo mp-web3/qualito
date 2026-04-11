@@ -19,21 +19,12 @@ Qualito analyzes your Claude Code sessions and gives you a **DQI score** (Delega
 ## Quick Start
 
 ```bash
-# Install
-pip install qualito
+# Install and set up (imports your existing Claude Code sessions)
+uvx qualito setup
 
-# Initialize in your project
-cd your-project
-qualito init
-
-# Import your Claude Code sessions
-qualito import
-
-# Score them
-qualito score
-
-# See results
-qualito status
+# Or install permanently
+uv tool install qualito
+qualito setup
 ```
 
 Every Claude Code user already has session data at `~/.claude/projects/`. Qualito reads it — you'll see your first scores in under 2 minutes.
@@ -51,7 +42,7 @@ qualito sync
 # → https://app.qualito.ai
 ```
 
-**Free tier:** 100 runs/month, 3 workspaces. **Pro ($29/mo):** unlimited.
+**Free tier:** 3 workspaces. **Pro ($29/mo):** unlimited workspaces + quality scoring.
 
 ## CLI Commands
 
@@ -64,6 +55,7 @@ qualito sync
 | `qualito costs` | Cost breakdown and waste analysis |
 | `qualito incidents` | Active quality incidents |
 | `qualito slo` | SLO compliance check |
+| `qualito reimport` | Re-import sessions with updated classification |
 | `qualito dashboard` | Launch local web dashboard |
 | `qualito login` | Authenticate with qualito.ai |
 | `qualito sync` | Push local data to cloud |
@@ -84,7 +76,7 @@ Use Qualito inline in your editor via MCP:
 }
 ```
 
-7 tools available: `dqi_score`, `dqi_cost`, `dqi_patterns`, `dqi_warnings`, `dqi_templates`, `dqi_incidents`, `dqi_slo`.
+8 tools available: `qualito_setup`, `dqi_score`, `dqi_cost`, `dqi_patterns`, `dqi_warnings`, `dqi_templates`, `dqi_incidents`, `dqi_slo`.
 
 ## Local Development
 
