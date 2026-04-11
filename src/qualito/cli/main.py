@@ -672,7 +672,10 @@ def setup(token):
                         sync_conn.close()
 
             # Report complete (triggers dashboard reload via SSE)
-            _report_setup_progress(api_url, token, "complete")
+            try:
+                _report_setup_progress(api_url, token, "complete")
+            except Exception:
+                pass  # Non-critical — data is already synced
 
             click.echo(
                 "\nSynced to cloud. Open app.qualito.ai to see your dashboard."
