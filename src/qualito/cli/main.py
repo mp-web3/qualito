@@ -1428,8 +1428,10 @@ def login(api_key: str | None, api_url: str | None):
             click.echo(f"Login failed: {e}")
             raise SystemExit(1)
     else:
-        click.echo(f"Open this URL to login: {url}/cli-auth")
-        click.echo("Then run: qualito login --api-key <your-key>")
+        click.echo("To log in:")
+        click.echo("  1. Go to https://app.qualito.ai/settings")
+        click.echo("  2. Copy your API key")
+        click.echo("  3. Run: qualito login --api-key <your-key>")
 
 
 # ---------------------------------------------------------------------------
@@ -1454,8 +1456,11 @@ def logout():
 @cli.command()
 @click.option("--since", default=None, help="Sync runs since date (ISO format)")
 @click.option("--all", "sync_all", is_flag=True, help="Sync all runs")
-def sync(since: str | None, sync_all: bool):
+@click.option("--workspace", "workspaces", multiple=True, help="Workspace(s) to sync (repeatable)")
+def sync(since: str | None, sync_all: bool, workspaces: tuple[str, ...]):
     """Sync local data to the Qualito cloud."""
+    import urllib.request
+
     from qualito.cloud import CloudError, load_credentials, sync_incidents, sync_runs
 
     creds = load_credentials()
@@ -1467,8 +1472,64 @@ def sync(since: str | None, sync_all: bool):
     try:
         since_date = None if sync_all else since
 
+        # Determine which workspaces to sync
+        selected_workspaces: list[str] | None = list(workspaces) if workspaces else None
+
+        if selected_workspaces is None:
+            # No explicit workspaces — check plan limits
+            ws_rows = conn.execute(
+                select(
+                    runs_table.c.workspace,
+                    func.count().label("cnt"),
+                ).group_by(runs_table.c.workspace).order_by(runs_table.c.workspace)
+            ).fetchall()
+            all_ws = [row[0] for row in ws_rows]
+            ws_counts = {row[0]: row[1] for row in ws_rows}
+
+            if len(all_ws) > 3:
+                # Check if user is on free plan
+                is_free = True
+                api_url = creds.get("api_url", "https://api.qualito.ai")
+                api_key = creds.get("api_key", "")
+                try:
+                    me_req = urllib.request.Request(
+                        f"{api_url}/api/auth/me",
+                        method="GET",
+                    )
+                    me_req.add_header("Authorization", f"Bearer {api_key}")
+                    me_req.add_header("User-Agent", "qualito-cli")
+                    with urllib.request.urlopen(me_req, timeout=10) as me_resp:
+                        me_data = json.loads(me_resp.read().decode())
+                        if me_data.get("plan") == "pro":
+                            is_free = False
+                except Exception:
+                    pass
+
+                if is_free:
+                    click.echo(
+                        "\nFree plan syncs up to 3 workspaces. "
+                        "Select which to sync:"
+                    )
+                    for i, ws in enumerate(all_ws, 1):
+                        click.echo(f"  [{i}] {ws} ({ws_counts[ws]} runs)")
+                    selection = click.prompt(
+                        "\nEnter numbers separated by commas (e.g. 1,2,3)",
+                        type=str,
+                    )
+                    indices = [
+                        int(s.strip()) for s in selection.split(",")
+                        if s.strip().isdigit()
+                    ]
+                    selected_workspaces = [
+                        all_ws[i - 1] for i in indices
+                        if 1 <= i <= len(all_ws)
+                    ][:3]
+                    if not selected_workspaces:
+                        click.echo("No valid workspaces selected. Skipping sync.")
+                        return
+
         click.echo("Syncing runs...")
-        run_result = sync_runs(conn, since=since_date)
+        run_result = sync_runs(conn, since=since_date, workspaces=selected_workspaces)
 
         click.echo("Syncing incidents...")
         inc_result = sync_incidents(conn)
