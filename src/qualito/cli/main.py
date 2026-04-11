@@ -682,9 +682,9 @@ def setup(token):
             )
 
         except Exception as e:
-            click.echo(
-                f"\nCloud sync error: {e}"
-            )
+            import traceback
+            click.echo(f"\nCloud sync error: {e}")
+            click.echo(traceback.format_exc())
             click.echo("Your data is imported locally.")
     else:
         # Interactive setup
