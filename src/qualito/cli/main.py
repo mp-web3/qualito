@@ -10,6 +10,7 @@ import click
 from sqlalchemy import and_, case, func, select
 
 from qualito import __version__
+
 from qualito.core.db import (
     evaluations_table,
     get_engine,
@@ -81,21 +82,17 @@ def cli():
 
 
 def _get_workspace_summary(conn) -> list[dict]:
-    """Query per-workspace summary: run count, avg DQI, total cost."""
-    join = runs_table.outerjoin(
-        evaluations_table,
-        and_(evaluations_table.c.run_id == runs_table.c.id,
-             evaluations_table.c.eval_type == "dqi"),
-    )
+    """Query per-workspace summary: run count, session types, total cost."""
     rows = conn.execute(
         select(
             runs_table.c.workspace,
             func.count().label("run_count"),
-            func.avg(evaluations_table.c.score).label("avg_dqi"),
+            func.sum(case((runs_table.c.session_type == "interactive", 1), else_=0)).label("interactive"),
+            func.sum(case((runs_table.c.session_type == "delegated", 1), else_=0)).label("delegated"),
             func.coalesce(func.sum(runs_table.c.cost_usd), 0).label("total_cost"),
-        ).select_from(join)
+        )
         .group_by(runs_table.c.workspace)
-        .order_by(runs_table.c.workspace)
+        .order_by(func.count().desc())
     ).mappings().fetchall()
     return [dict(r) for r in rows]
 
@@ -220,27 +217,25 @@ def _display_results_table(summaries: list[dict]):
         click.echo("No data to display.")
         return
 
-    click.echo(f"\n{'Workspace':<25} {'Runs':>6} {'Avg DQI':>10} {'Cost':>10}")
-    click.echo("-" * 55)
-    all_dqi = []
+    click.echo(f"\n{'Workspace':<20} {'Sessions':>8} {'Interactive':>12} {'Delegated':>10} {'Cost (est.)':>12}")
+    click.echo("-" * 66)
+    total_runs = 0
+    total_interactive = 0
+    total_delegated = 0
+    total_cost = 0
     for s in summaries:
-        ws = (s["workspace"] or "?")[:23]
+        ws = (s["workspace"] or "?")[:18]
         runs = s["run_count"]
-        avg = s["avg_dqi"]
+        interactive = s.get("interactive", 0) or 0
+        delegated = s.get("delegated", 0) or 0
         cost = s["total_cost"]
-        if avg is not None:
-            all_dqi.append(avg)
-        dqi_str = f"{avg:.3f}" if avg is not None else "N/A"
-        click.echo(f"{ws:<25} {runs:>6} {dqi_str:>10} {_fmt_cost(cost):>10}")
-    click.echo("-" * 55)
-
-    overall_avg = sum(all_dqi) / len(all_dqi) if all_dqi else None
-    if overall_avg is not None:
-        label = _dqi_label(overall_avg)
-        click.echo(
-            f"\nAverage DQI: {overall_avg:.2f} ({label}) — "
-            f"scores 0-1. Above 0.7 is good, below 0.5 needs attention."
-        )
+        total_runs += runs
+        total_interactive += interactive
+        total_delegated += delegated
+        total_cost += cost
+        click.echo(f"{ws:<20} {runs:>8} {interactive:>12} {delegated:>10} {'~' + _fmt_cost(cost):>12}")
+    click.echo("-" * 66)
+    click.echo(f"{'Total':<20} {total_runs:>8} {total_interactive:>12} {total_delegated:>10} {'~' + _fmt_cost(total_cost):>12}")
 
 
 # ---------------------------------------------------------------------------
