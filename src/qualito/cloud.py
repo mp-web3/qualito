@@ -62,7 +62,7 @@ class CloudError(Exception):
         self.status_code = status_code
 
 
-def cloud_request(method: str, path: str, data: dict | None = None) -> dict:
+def cloud_request(method: str, path: str, data: dict | None = None, timeout: int = 30) -> dict:
     """Make an authenticated HTTP request to the Qualito cloud API.
 
     Args:
@@ -90,7 +90,7 @@ def cloud_request(method: str, path: str, data: dict | None = None) -> dict:
     req.add_header("User-Agent", "qualito-cli")
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         if e.code == 401:
@@ -112,7 +112,12 @@ def _collect_run_data(conn, run_id: str) -> dict:
     return get_run(conn, run_id) or {}
 
 
-def sync_runs(conn, since: str | None = None, workspaces: list[str] | None = None) -> dict:
+def sync_runs(
+    conn,
+    since: str | None = None,
+    workspaces: list[str] | None = None,
+    progress_callback=None,
+) -> dict:
     """Sync local runs to the cloud API.
 
     Args:
@@ -120,6 +125,8 @@ def sync_runs(conn, since: str | None = None, workspaces: list[str] | None = Non
         since: ISO date string — only sync runs started after this date.
                If None, syncs all runs.
         workspaces: List of workspace names to sync. If None, syncs all workspaces.
+        progress_callback: Optional callable(batch_num, total_batches, runs_in_batch, status)
+            where status is "sending" or "done" or "failed".
 
     Returns:
         dict with keys: synced, skipped, errors.
@@ -145,18 +152,29 @@ def sync_runs(conn, since: str | None = None, workspaces: list[str] | None = Non
     if not batch:
         return {"synced": 0, "skipped": 0, "errors": 0}
 
-    # Send in batches of 50
+    # Send in small batches to avoid timeouts on large workspaces
     total_synced = 0
     total_skipped = 0
     total_errors = 0
-    batch_size = 50
+    batch_size = 10
+    total_batches = (len(batch) + batch_size - 1) // batch_size
 
     for i in range(0, len(batch), batch_size):
+        batch_num = i // batch_size + 1
         chunk = batch[i : i + batch_size]
-        result = cloud_request("POST", "/api/sync/runs", {"runs": chunk})
-        total_synced += result.get("synced", 0)
-        total_skipped += result.get("skipped", 0)
-        total_errors += result.get("errors", 0)
+        if progress_callback:
+            progress_callback(batch_num, total_batches, len(chunk), "sending")
+        try:
+            result = cloud_request("POST", "/api/sync/runs", {"runs": chunk}, timeout=120)
+            total_synced += result.get("synced", 0)
+            total_skipped += result.get("skipped", 0)
+            total_errors += result.get("errors", 0)
+            if progress_callback:
+                progress_callback(batch_num, total_batches, len(chunk), "done")
+        except Exception:
+            if progress_callback:
+                progress_callback(batch_num, total_batches, len(chunk), "failed")
+            raise
 
     return {"synced": total_synced, "skipped": total_skipped, "errors": total_errors}
 

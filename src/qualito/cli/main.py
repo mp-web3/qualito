@@ -654,14 +654,30 @@ def setup(token):
                 if selected_workspaces is not None and len(selected_workspaces) == 0:
                     pass  # User selected nothing, skip sync
                 else:
-                    click.echo("Syncing to cloud...")
+                    click.echo("\nSyncing to cloud...")
                     engine = get_engine(str(db_path))
                     sync_conn = get_sa_connection(engine)
+
+                    def _progress(batch_num, total_batches, runs_in_batch, status):
+                        if status == "sending":
+                            click.echo(
+                                f"  Batch {batch_num}/{total_batches} — sending {runs_in_batch} runs...",
+                                nl=False,
+                            )
+                        elif status == "done":
+                            click.echo(" ✓")
+                        elif status == "failed":
+                            click.echo(" ✗")
+
                     try:
-                        run_result = sync_runs(sync_conn, workspaces=selected_workspaces)
+                        run_result = sync_runs(
+                            sync_conn,
+                            workspaces=selected_workspaces,
+                            progress_callback=_progress,
+                        )
                         inc_result = sync_incidents(sync_conn)
                         click.echo(
-                            f"Synced {run_result['synced']} runs to cloud."
+                            f"\nSynced {run_result['synced']} runs to cloud."
                         )
                     finally:
                         sync_conn.close()
@@ -673,14 +689,15 @@ def setup(token):
                 pass  # Non-critical — data is already synced
 
             click.echo(
-                "\nSynced to cloud. View your runs at: https://app.qualito.ai/runs"
+                "\nView your runs at: https://app.qualito.ai/runs"
             )
 
         except Exception as e:
-            import traceback
-            click.echo(f"\nCloud sync error: {e}")
-            click.echo(traceback.format_exc())
-            click.echo("Your data is imported locally.")
+            click.echo(f"\nSync failed: {e}")
+            click.echo(
+                "Your data is imported locally. Some runs may have synced — "
+                "run `qualito sync` to resume (already-synced runs will be skipped)."
+            )
     else:
         # Interactive setup
         global_dir = Path.home() / ".qualito"
@@ -1524,7 +1541,21 @@ def sync(since: str | None, sync_all: bool, workspaces: tuple[str, ...]):
                         return
 
         click.echo("Syncing runs...")
-        run_result = sync_runs(conn, since=since_date, workspaces=selected_workspaces)
+
+        def _progress(batch_num, total_batches, runs_in_batch, status):
+            if status == "sending":
+                click.echo(
+                    f"  Batch {batch_num}/{total_batches} — sending {runs_in_batch} runs...",
+                    nl=False,
+                )
+            elif status == "done":
+                click.echo(" ✓")
+            elif status == "failed":
+                click.echo(" ✗")
+
+        run_result = sync_runs(
+            conn, since=since_date, workspaces=selected_workspaces, progress_callback=_progress
+        )
 
         click.echo("Syncing incidents...")
         inc_result = sync_incidents(conn)
