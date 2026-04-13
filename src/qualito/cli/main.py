@@ -12,7 +12,6 @@ from sqlalchemy import and_, case, func, select
 from qualito import __version__
 
 from qualito.core.db import (
-    evaluations_table,
     get_engine,
     get_sa_connection,
     runs_table,
@@ -69,6 +68,76 @@ def _fmt_pct(val) -> str:
     return f"{val:.1f}%"
 
 
+def _fmt_tokens(n) -> str:
+    """Format a token count humanized (e.g. '4.2M', '125k', '0.05M').
+
+    Used by status and costs commands for compact column layouts.
+    """
+    if n is None:
+        return "0"
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "0"
+    if n == 0:
+        return "0"
+    if n >= 1_000_000:
+        val = n / 1_000_000
+        if val >= 100:
+            return f"{val:.0f}M"
+        if val >= 10:
+            return f"{val:.1f}M"
+        return f"{val:.2f}M"
+    if n >= 1_000:
+        val = n / 1_000
+        if val >= 100:
+            return f"{val:.0f}k"
+        return f"{val:.1f}k"
+    return str(n)
+
+
+def _fmt_relative_time(iso_str) -> str:
+    """Format an ISO date/time string as a relative time (e.g. '2 hours ago').
+
+    Accepts None or empty string and returns 'never'.
+    """
+    if not iso_str:
+        return "never"
+    try:
+        # Handle both date-only and full ISO strings; strip timezone 'Z'
+        s = str(iso_str).replace("Z", "+00:00")
+        ts = datetime.fromisoformat(s)
+        if ts.tzinfo is not None:
+            ts = ts.replace(tzinfo=None)
+    except (TypeError, ValueError):
+        return str(iso_str)
+
+    now = datetime.now()
+    delta = now - ts
+    secs = delta.total_seconds()
+    if secs < 0:
+        return "just now"
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        mins = int(secs // 60)
+        return f"{mins} minute{'s' if mins != 1 else ''} ago"
+    if secs < 86400:
+        hours = int(secs // 3600)
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+    if secs < 86400 * 7:
+        days = int(secs // 86400)
+        return f"{days} day{'s' if days != 1 else ''} ago"
+    if secs < 86400 * 30:
+        weeks = int(secs // (86400 * 7))
+        return f"{weeks} week{'s' if weeks != 1 else ''} ago"
+    if secs < 86400 * 365:
+        months = int(secs // (86400 * 30))
+        return f"{months} month{'s' if months != 1 else ''} ago"
+    years = int(secs // (86400 * 365))
+    return f"{years} year{'s' if years != 1 else ''} ago"
+
+
 @click.group()
 @click.version_option(version=__version__)
 def cli():
@@ -82,7 +151,7 @@ def cli():
 
 
 def _get_workspace_summary(conn) -> list[dict]:
-    """Query per-workspace summary: run count, session types, total cost."""
+    """Query per-workspace summary: run count, session types, tokens, cost, last activity."""
     rows = conn.execute(
         select(
             runs_table.c.workspace,
@@ -90,6 +159,10 @@ def _get_workspace_summary(conn) -> list[dict]:
             func.sum(case((runs_table.c.session_type == "interactive", 1), else_=0)).label("interactive"),
             func.sum(case((runs_table.c.session_type == "delegated", 1), else_=0)).label("delegated"),
             func.coalesce(func.sum(runs_table.c.cost_usd), 0).label("total_cost"),
+            func.coalesce(func.sum(runs_table.c.input_tokens), 0).label("input_tokens"),
+            func.coalesce(func.sum(runs_table.c.output_tokens), 0).label("output_tokens"),
+            func.coalesce(func.sum(runs_table.c.cache_read_tokens), 0).label("cache_read_tokens"),
+            func.max(runs_table.c.started_at).label("last_started_at"),
         )
         .group_by(runs_table.c.workspace)
         .order_by(func.count().desc())
@@ -502,7 +575,7 @@ def _run_interactive_setup_rerun():
         conn.close()
 
 
-@cli.command()
+@cli.command(help="First-time setup: import sessions, configure MCP, optional cloud sync")
 @click.argument("token", required=False)
 def setup(token):
     """Set up Qualito — discover and import Claude Code sessions.
@@ -658,22 +731,25 @@ def setup(token):
                     engine = get_engine(str(db_path))
                     sync_conn = get_sa_connection(engine)
 
-                    def _progress(batch_num, total_batches, runs_in_batch, status):
-                        if status == "sending":
-                            click.echo(
-                                f"  Batch {batch_num}/{total_batches} — sending {runs_in_batch} runs...",
-                                nl=False,
-                            )
-                        elif status == "done":
-                            click.echo(" ✓")
-                        elif status == "failed":
-                            click.echo(" ✗")
+                    current_ws = {"name": None}
+
+                    def _on_batch(ws, batch_num, total_batches, runs_in_batch):
+                        if current_ws["name"] != ws:
+                            click.echo(f"\n  {ws}")
+                            current_ws["name"] = ws
+                        click.echo(
+                            f"    Batch {batch_num}/{total_batches} — sent {runs_in_batch} runs ✓"
+                        )
+
+                    def _on_workspace_done(ws, ws_synced):
+                        click.echo(f"  ✓ {ws} synced ({ws_synced} sessions)")
 
                     try:
                         run_result = sync_runs(
                             sync_conn,
                             workspaces=selected_workspaces,
-                            progress_callback=_progress,
+                            on_batch=_on_batch,
+                            on_workspace_done=_on_workspace_done,
                         )
                         inc_result = sync_incidents(sync_conn)
                         click.echo(
@@ -707,63 +783,18 @@ def setup(token):
             _run_interactive_setup_first_run()
 
 
-# ---------------------------------------------------------------------------
-# qualito init
-# ---------------------------------------------------------------------------
-
-
-@cli.command()
-@click.option("--dir", "project_dir", type=click.Path(exists=True, path_type=Path),
-              default=None, help="Project directory (default: cwd)")
-@click.option("--local", is_flag=True, default=False,
-              help="Create per-project .qualito/ instead of global ~/.qualito/")
-def init(project_dir: Path | None, local: bool):
-    """Initialize Qualito (global ~/.qualito/ by default, --local for per-project)."""
-    if project_dir is None:
-        project_dir = Path.cwd()
-
-    from qualito.config import init_project
-
-    # Check for Claude Code markers
-    markers = []
-    if (project_dir / "CLAUDE.md").exists():
-        markers.append("CLAUDE.md")
-    if (project_dir / ".claude.json").exists():
-        markers.append(".claude.json")
-    if (project_dir / ".claude").is_dir():
-        markers.append(".claude/")
-
-    config, qualito_dir = init_project(project_dir, local=local)
-
-    mode = "local" if local else "global"
-    click.echo(f"Initialized Qualito ({mode}) in {qualito_dir}")
-    click.echo(f"  Workspace: {config.workspace}")
-    click.echo(f"  DB: {config.db_path}")
-    click.echo(f"  Config: {qualito_dir / 'config.toml'}")
-    if markers:
-        click.echo(f"  Detected: {', '.join(markers)}")
-    else:
-        click.echo("  No Claude Code markers found (CLAUDE.md, .claude.json, .claude/)")
-
-
-@cli.command()
+@cli.command(help="See your local and cloud sync state")
 @click.option("--dir", "project_dir", type=click.Path(exists=True, path_type=Path),
               default=None, help="Project directory (default: cwd)")
 def status(project_dir: Path | None):
-    """Show Qualito status for the current project."""
+    """Show Qualito status: local sessions, cloud sync, per-workspace breakdown."""
     if project_dir is None:
         project_dir = Path.cwd()
 
     global_dir = Path.home() / ".qualito"
     local_dir = project_dir / ".qualito"
 
-    if local_dir.exists():
-        qualito_dir = local_dir
-        mode = "local"
-    elif global_dir.exists():
-        qualito_dir = global_dir
-        mode = "global"
-    else:
+    if not local_dir.exists() and not global_dir.exists():
         click.echo("Qualito not initialized. Run 'qualito init' first.")
         raise SystemExit(1)
 
@@ -771,46 +802,177 @@ def status(project_dir: Path | None):
 
     config = load_config(project_dir)
 
-    # Resolve DB path
     db_path = config.db_path
     if not db_path.is_absolute():
         db_path = project_dir / db_path
 
-    click.echo(f"Mode: {mode}")
-    click.echo(f"Workspace: {config.workspace}")
-    click.echo(f"Config: {qualito_dir / 'config.toml'}")
-    click.echo(f"DB: {db_path} ({'exists' if db_path.exists() else 'missing'})")
+    # Display-friendly DB path: replace home prefix with ~
+    try:
+        display_db = "~/" + str(db_path.relative_to(Path.home()))
+    except ValueError:
+        display_db = str(db_path)
 
-    # SLOs
-    click.echo(f"SLOs: quality={config.slo_quality:.0%}, "
-               f"availability={config.slo_availability:.0%}, "
-               f"cost=${config.slo_cost:.2f}")
+    click.echo("Qualito Status\n")
 
-    # Run count
+    # -----------------------------------------------------------------------
+    # Local section
+    # -----------------------------------------------------------------------
+    click.echo("Local")
+    click.echo(f"  Database: {display_db}")
+
+    summaries: list[dict] = []
+    total_runs = 0
+    total_interactive = 0
+    total_delegated = 0
+
     if db_path.exists():
         engine = get_engine(str(db_path))
         conn = get_sa_connection(engine)
-        row = conn.execute(
-            select(func.count().label("n")).select_from(runs_table)
-        ).mappings().fetchone()
-        run_count = row["n"]
-        conn.close()
-        click.echo(f"Runs: {run_count}")
+        try:
+            summaries = _get_workspace_summary(conn)
+        finally:
+            conn.close()
+
+        for s in summaries:
+            total_runs += int(s.get("run_count") or 0)
+            total_interactive += int(s.get("interactive") or 0)
+            total_delegated += int(s.get("delegated") or 0)
+
+        click.echo(f"  Sessions: {total_runs} imported")
+        click.echo(f"    Interactive: {total_interactive}")
+        click.echo(f"    Delegated: {total_delegated}")
+        click.echo(f"  Workspaces: {len(summaries)}")
     else:
-        click.echo("Runs: 0 (no database)")
+        click.echo("  Sessions: 0 imported (no database)")
+        click.echo("    Interactive: 0")
+        click.echo("    Delegated: 0")
+        click.echo("  Workspaces: 0")
+
+    # Per-workspace table
+    if summaries:
+        click.echo("")
+        click.echo("  Per workspace:")
+        header = (
+            f"    {'workspace':<16} {'sessions':>8} {'in tokens':>11} "
+            f"{'out tokens':>12} {'~cost':>10}   {'last':<}"
+        )
+        click.echo(header)
+        for s in summaries:
+            ws = str(s.get("workspace") or "")[:16]
+            sessions = int(s.get("run_count") or 0)
+            in_tok = _fmt_tokens(s.get("input_tokens"))
+            out_tok = _fmt_tokens(s.get("output_tokens"))
+            cost_val = float(s.get("total_cost") or 0.0)
+            cost_str = f"~${cost_val:,.2f}" if cost_val < 1000 else f"~${cost_val:,.0f}"
+            last = _fmt_relative_time(s.get("last_started_at"))
+            click.echo(
+                f"    {ws:<16} {sessions:>8} {in_tok:>11} "
+                f"{out_tok:>12} {cost_str:>10}   {last}"
+            )
+
+    # -----------------------------------------------------------------------
+    # Cloud section
+    # -----------------------------------------------------------------------
+    click.echo("")
+
+    from qualito.cloud import CloudError, load_credentials
+
+    creds = load_credentials()
+    if not creds:
+        click.echo("Cloud: not logged in. Run: qualito login")
+    else:
+        from qualito.cloud import fetch_synced_workspaces, fetch_user
+
+        user_info: dict = {}
+        synced: list[dict] = []
+        cloud_error: str | None = None
+        try:
+            user_info = fetch_user()
+        except CloudError as e:
+            cloud_error = str(e)
+        if cloud_error is None:
+            try:
+                synced = fetch_synced_workspaces()
+            except CloudError as e:
+                cloud_error = str(e)
+
+        if cloud_error is not None:
+            click.echo(f"Cloud: error reaching api.qualito.ai ({cloud_error})")
+        else:
+            email = user_info.get("email") or "unknown"
+            plan = (user_info.get("plan") or "free").lower()
+            click.echo(f"Cloud ({email}, {plan} plan)")
+
+            if synced:
+                synced_names = sorted(
+                    [str(w.get("workspace_name") or "") for w in synced if w.get("workspace_name")]
+                )
+                synced_sessions = sum(int(w.get("session_count") or 0) for w in synced)
+                last_sync_iso = max(
+                    (w.get("last_synced_at") for w in synced if w.get("last_synced_at")),
+                    default=None,
+                )
+
+                click.echo(f"  Synced workspaces: {', '.join(synced_names)}")
+                click.echo(f"  Synced sessions: {synced_sessions}")
+                click.echo(f"  Last sync: {_fmt_relative_time(last_sync_iso)}")
+                click.echo("  Dashboard: https://app.qualito.ai/runs")
+
+                local_names = {
+                    str(s.get("workspace") or "") for s in summaries if s.get("workspace")
+                }
+                synced_set = set(synced_names)
+                local_only = sorted(local_names - synced_set)
+                if local_only:
+                    click.echo("")
+                    click.echo("Local-only workspaces (not synced):")
+                    click.echo(f"  {', '.join(local_only)}")
+
+                if plan == "free":
+                    click.echo("")
+                    click.echo("To sync more workspaces (free plan limit: 3):")
+                    click.echo("  - Upgrade to Pro: https://app.qualito.ai/settings")
+                    click.echo("  - Or unsync: qualito sync --unsync <workspace>")
+            else:
+                click.echo("  No workspaces synced yet. Run: qualito sync")
+
+    # -----------------------------------------------------------------------
+    # Cost disclaimer footer
+    # -----------------------------------------------------------------------
+    click.echo("")
+    click.echo(
+        "⚠  Costs are estimates. Claude Code session files undercount output_tokens"
+    )
+    click.echo(
+        "   ~1.9x (upstream bug, never fixed). Reliable for comparing workspaces"
+    )
+    click.echo(
+        "   and tracking trends, but absolute totals are understated."
+    )
+    click.echo("   Run `qualito costs --explain` for details.")
 
 
 # ---------------------------------------------------------------------------
 # dqi import
 # ---------------------------------------------------------------------------
 
-@cli.command(name="import")
+@cli.command(
+    name="import",
+    help="Import Claude Code sessions for measurement (--force to re-process)",
+)
 @click.option("--dir", "project_dir", type=click.Path(exists=True, path_type=Path),
               default=None, help="Project directory (default: cwd)")
 @click.option("--workspace", default=None, help="Override workspace name")
 @click.option("--all-projects", is_flag=True, default=False,
               help="Import all discovered Claude Code projects")
-def import_sessions(project_dir: Path | None, workspace: str | None, all_projects: bool):
+@click.option("--force", is_flag=True, default=False,
+              help="Re-process existing sessions with current extraction logic")
+def import_sessions(
+    project_dir: Path | None,
+    workspace: str | None,
+    all_projects: bool,
+    force: bool,
+):
     """Import existing Claude Code sessions into Qualito."""
     if project_dir is None:
         project_dir = Path.cwd()
@@ -821,6 +983,38 @@ def import_sessions(project_dir: Path | None, workspace: str | None, all_project
     db_path = config.db_path
     if not db_path.is_absolute():
         db_path = project_dir / db_path
+
+    if force:
+        if not db_path.exists():
+            click.echo("No Qualito database found. Run 'qualito setup' first.")
+            raise SystemExit(1)
+
+        from qualito.importer import reimport_all
+
+        engine = get_engine(str(db_path))
+        conn = get_sa_connection(engine)
+        try:
+            click.echo("Re-importing all sessions with updated extraction...")
+            click.echo("This will delete and re-import all existing run records.\n")
+
+            result = reimport_all(conn)
+
+            imported = result["interactive"] + result["delegated"]
+            click.echo(f"Re-imported {imported} sessions.")
+            click.echo(f"  Interactive: {result['interactive']}")
+            click.echo(f"  Delegated:   {result['delegated']}")
+            click.echo(f"  Skipped (VS Code): {result['skipped_vscode']}")
+            click.echo(
+                f"  Skipped (empty/unknown): "
+                f"{result['skipped_unknown'] + result['skipped_empty']}"
+            )
+
+            if imported > 0:
+                summaries = _get_workspace_summary(conn)
+                _display_results_table(summaries)
+        finally:
+            conn.close()
+        return
 
     if all_projects:
         # Import all discovered projects into the global DB
@@ -902,504 +1096,331 @@ def import_sessions(project_dir: Path | None, workspace: str | None, all_project
 
 
 # ---------------------------------------------------------------------------
-# qualito reimport
+# qualito costs
 # ---------------------------------------------------------------------------
 
-
-@cli.command()
-@click.option("--dir", "project_dir", type=click.Path(exists=True, path_type=Path),
-              default=None, help="Project directory (default: cwd)")
-def reimport(project_dir: Path | None):
-    """Re-import all sessions with updated extraction logic.
-
-    Deletes existing run records and re-imports from JSONL files
-    using the new session classification and metadata extraction.
-    """
-    if project_dir is None:
-        project_dir = Path.cwd()
-
-    from qualito.config import load_config
-
-    config = load_config(project_dir)
-    db_path = config.db_path
-    if not db_path.is_absolute():
-        db_path = project_dir / db_path
-
-    if not db_path.exists():
-        click.echo("No Qualito database found. Run 'qualito setup' first.")
-        raise SystemExit(1)
-
-    from qualito.importer import reimport_all
-
-    engine = get_engine(str(db_path))
-    conn = get_sa_connection(engine)
-    try:
-        click.echo("Re-importing all sessions with updated extraction...")
-        click.echo("This will delete and re-import all existing run records.\n")
-
-        result = reimport_all(conn)
-
-        imported = result["interactive"] + result["delegated"]
-        click.echo(f"Re-imported {imported} sessions.")
-        click.echo(f"  Interactive: {result['interactive']}")
-        click.echo(f"  Delegated:   {result['delegated']}")
-        click.echo(f"  Skipped (VS Code): {result['skipped_vscode']}")
-        click.echo(f"  Skipped (empty/unknown): {result['skipped_unknown'] + result['skipped_empty']}")
-
-        if imported > 0:
-            summaries = _get_workspace_summary(conn)
-            _display_results_table(summaries)
-    finally:
-        conn.close()
+# Empirical output_tokens undercount factor (upstream bug #27361).
+# 128-call Opus session: 23,725 recorded vs 45,050 re-tokenized → 1.9x.
+_OUTPUT_UNDERCOUNT_FACTOR = 1.9
 
 
-# ---------------------------------------------------------------------------
-# dqi score
-# ---------------------------------------------------------------------------
+def _compute_cost(
+    pricing: dict,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    correct: bool,
+) -> float:
+    """Recompute cost from tokens with optional 1.9x correction on output."""
+    out = output_tokens * _OUTPUT_UNDERCOUNT_FACTOR if correct else output_tokens
+    return (
+        (input_tokens * pricing["input"] / 1_000_000)
+        + (out * pricing["output"] / 1_000_000)
+        + (cache_read_tokens * pricing["cache_read"] / 1_000_000)
+    )
 
-@cli.command()
-@click.option("--workspace", default=None, help="Filter by workspace")
-@click.option("--days", default=30, help="Lookback period in days (default: 30)")
-@click.option("--limit", default=20, help="Max rows to show (default: 20)")
-def score(workspace: str | None, days: int, limit: int):
-    """Show DQI scores for recent runs."""
-    conn, config = _get_conn()
-    try:
-        since = _since_date(days)
-        join = evaluations_table.join(runs_table, evaluations_table.c.run_id == runs_table.c.id)
-        conds = [evaluations_table.c.eval_type == "dqi", runs_table.c.started_at >= since]
-        if workspace:
-            conds.append(runs_table.c.workspace == workspace)
 
-        rows = conn.execute(
-            select(
-                runs_table.c.id, runs_table.c.workspace, runs_table.c.task_type,
-                evaluations_table.c.score.label("dqi"),
-                evaluations_table.c.categories, runs_table.c.cost_usd,
-                runs_table.c.started_at,
-            ).select_from(join)
-            .where(and_(*conds))
-            .order_by(runs_table.c.started_at.desc())
-            .limit(limit)
-        ).mappings().fetchall()
-
-        if not rows:
-            click.echo(f"No DQI scores found in the last {days} days.")
-            return
-
-        # Header
-        click.echo(f"\nDQI Scores (last {days} days)")
-        click.echo("=" * 90)
+def _print_costs_explain(model_pricing: dict):
+    """Print pricing constants + upstream bug explanation, then return."""
+    click.echo()
+    click.echo("qualito costs — how cost is calculated and why it's an estimate")
+    click.echo()
+    click.echo("How cost is computed")
+    click.echo("  cost_usd = (input_tokens   × input_price")
+    click.echo("              + output_tokens × output_price")
+    click.echo("              + cache_read    × cache_read_price) / 1,000,000")
+    click.echo()
+    click.echo("  Pricing per million tokens:")
+    display_rows = [
+        ("claude-opus-4-6", model_pricing["claude-opus-4-6"]),
+        ("claude-sonnet-4-6", model_pricing["claude-sonnet-4-6"]),
+        ("claude-haiku-4-5", model_pricing["claude-haiku-4-5-20251001"]),
+    ]
+    for label, p in display_rows:
+        i = f"${p['input']:.2f}"
+        o = f"${p['output']:.2f}"
+        cr = f"${p['cache_read']:.2f}"
         click.echo(
-            f"{'Run ID':<12} {'Workspace':<18} {'Task Type':<12} "
-            f"{'DQI':>6} {'Tier':<10} {'Cost':>8} {'Date':<12}"
+            f"    {label:<20} input {i:>6}   output {o:>6}   cache_read {cr:>6}"
         )
-        click.echo("-" * 90)
-
-        dqi_scores = []
-        for r in rows:
-            run_id = r["id"][:10] if r["id"] else "?"
-            ws = (r["workspace"] or "?")[:16]
-            task_type = (r["task_type"] or "other")[:10]
-            dqi_val = r["dqi"]
-            dqi_str = f"{dqi_val:.3f}" if dqi_val is not None else "N/A"
-            if dqi_val is not None:
-                dqi_scores.append(dqi_val)
-
-            # Parse tier from categories JSON
-            tier_label = "?"
-            cats = r["categories"]
-            if cats:
-                try:
-                    parsed = json.loads(cats) if isinstance(cats, str) else cats
-                    tier_label = parsed.get("tier_label", "?")
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
-            cost_str = _fmt_cost(r["cost_usd"])
-            date_str = (r["started_at"] or "")[:10]
-
-            click.echo(
-                f"{run_id:<12} {ws:<18} {task_type:<12} "
-                f"{dqi_str:>6} {tier_label:<10} {cost_str:>8} {date_str:<12}"
-            )
-
-        click.echo("-" * 90)
-
-        # Averages
-        if dqi_scores:
-            avg_dqi = sum(dqi_scores) / len(dqi_scores)
-            click.echo(f"\nAverage DQI: {avg_dqi:.3f}  ({len(dqi_scores)} scored runs)")
-
-            # Trend: last 10 vs previous 10
-            if len(dqi_scores) >= 10:
-                recent_10 = dqi_scores[:10]
-                prev_10 = dqi_scores[10:20] if len(dqi_scores) >= 20 else dqi_scores[10:]
-                if prev_10:
-                    recent_avg = sum(recent_10) / len(recent_10)
-                    prev_avg = sum(prev_10) / len(prev_10)
-                    diff = recent_avg - prev_avg
-                    if diff > 0.02:
-                        arrow = "^ improving"
-                    elif diff < -0.02:
-                        arrow = "v declining"
-                    else:
-                        arrow = "= stable"
-                    click.echo(
-                        f"Trend: {arrow} "
-                        f"(recent 10: {recent_avg:.3f}, prev: {prev_avg:.3f})"
-                    )
-        click.echo()
-    finally:
-        conn.close()
+    click.echo()
+    click.echo("  Cost is derived from tokens — Claude Code does not record cost directly.")
+    click.echo("  qualito reads token counts from your local Claude Code session files")
+    click.echo("  (~/.claude/projects/) and applies the model-specific pricing above.")
+    click.echo()
+    click.echo("The upstream bug")
+    click.echo("  Claude Code's session JSONL files do not record the final message_stop")
+    click.echo("  event from the Anthropic API. The output_tokens field is captured from")
+    click.echo("  mid-stream snapshots instead of the final tally, causing a ~1.9x")
+    click.echo("  undercount on output_tokens.")
+    click.echo()
+    click.echo("  Empirical measurement (from the original bug report): a 128-call Opus")
+    click.echo("  session recorded 23,725 output tokens in JSONL vs 45,050 tokens when")
+    click.echo("  the generated content was re-tokenized with tiktoken — a 1.9x ratio.")
+    click.echo()
+    click.echo("  Bug report (auto-closed without a fix on 2026-03-24):")
+    click.echo("    https://github.com/anthropics/claude-code/issues/27361")
+    click.echo()
+    click.echo("  No upstream fix is available. There are three known duplicate reports")
+    click.echo("  (#22671, #22686, #25941). The bug affects every tool that derives cost")
+    click.echo("  from Claude Code session files, not just qualito.")
+    click.echo()
+    click.echo("What's affected, what isn't")
+    click.echo("  Affected:    output_tokens only")
+    click.echo("  Accurate:    input_tokens, cache_read_input_tokens")
+    click.echo()
+    click.echo("  input and cache_read are set at request start, before streaming, and")
+    click.echo("  recorded correctly. Only the streaming output count is wrong.")
+    click.echo()
+    click.echo("Why it matters more than it sounds")
+    click.echo("  For Opus, output costs $75 per million tokens versus $15 for input — a")
+    click.echo("  5x premium per token. Even though output_tokens is the smaller count in")
+    click.echo("  most sessions, the output portion typically dominates total cost. A 1.9x")
+    click.echo("  undercount on output tokens often means true spend is 30-50% higher than")
+    click.echo("  shown for Opus-heavy workspaces.")
+    click.echo()
+    click.echo("The --correct workaround")
+    click.echo("  qualito costs --correct multiplies output_tokens by 1.9 and recomputes")
+    click.echo("  cost end-to-end. The result is an estimate: 1.9 is one empirical data")
+    click.echo("  point, not a guaranteed correction factor for every workload. For the")
+    click.echo("  authoritative number, check your Anthropic billing dashboard.")
+    click.echo()
 
 
-# ---------------------------------------------------------------------------
-# dqi costs
-# ---------------------------------------------------------------------------
-
-@cli.command()
+@cli.command(help="Analyze spending by workspace, model, and time")
 @click.option("--workspace", default=None, help="Filter by workspace")
 @click.option("--days", default=30, help="Lookback period in days (default: 30)")
-def costs(workspace: str | None, days: int):
-    """Cost breakdown and waste analysis."""
-    conn, config = _get_conn()
+@click.option("--top", default=10, help="Show top N most expensive sessions (default: 10)")
+@click.option("--correct", is_flag=True, default=False,
+              help="Apply 1.9x correction to output_tokens to compensate for upstream undercount")
+@click.option("--explain", is_flag=True, default=False,
+              help="Print pricing constants + upstream bug explanation and exit")
+def costs(workspace: str | None, days: int, top: int, correct: bool, explain: bool):
+    """Analyze spending by workspace, model, and time."""
+    from qualito.importer import DEFAULT_PRICING, MODEL_PRICING
+
+    if explain:
+        _print_costs_explain(MODEL_PRICING)
+        return
+
+    conn, _config = _get_conn()
     try:
         since = _since_date(days)
-        base_conds = [runs_table.c.started_at >= since]
+        base_conds = [
+            runs_table.c.started_at >= since,
+            runs_table.c.cost_usd.isnot(None),
+        ]
         if workspace:
             base_conds.append(runs_table.c.workspace == workspace)
 
-        # Overall stats
-        stats = conn.execute(
-            select(
-                func.count().label("total_runs"),
-                func.coalesce(func.sum(runs_table.c.cost_usd), 0).label("total_spend"),
-                func.avg(runs_table.c.cost_usd).label("avg_per_run"),
-            ).where(and_(*base_conds))
-        ).mappings().fetchone()
-
-        total_runs = stats["total_runs"]
-        total_spend = stats["total_spend"] or 0
-        avg_per_run = stats["avg_per_run"]
-
-        click.echo(f"\nCost Analysis (last {days} days)")
-        click.echo("=" * 60)
-        click.echo(f"Total runs:     {total_runs}")
-        click.echo(f"Total spend:    {_fmt_cost(total_spend)}")
-        click.echo(f"Avg per run:    {_fmt_cost(avg_per_run)}")
-
-        # Cost by workspace
-        ws_rows = conn.execute(
+        # Aggregate by (workspace, model) — single source for per-workspace
+        # and per-model views in both raw and corrected modes.
+        ws_model_rows = conn.execute(
             select(
                 runs_table.c.workspace,
+                runs_table.c.model,
                 func.count().label("runs"),
-                func.coalesce(func.sum(runs_table.c.cost_usd), 0).label("total"),
-                func.avg(runs_table.c.cost_usd).label("avg"),
+                func.coalesce(func.sum(runs_table.c.input_tokens), 0).label("input"),
+                func.coalesce(func.sum(runs_table.c.output_tokens), 0).label("output"),
+                func.coalesce(func.sum(runs_table.c.cache_read_tokens), 0).label("cache_read"),
+                func.coalesce(func.sum(runs_table.c.cost_usd), 0).label("raw_cost"),
             ).where(and_(*base_conds))
-            .group_by(runs_table.c.workspace)
-            .order_by(func.coalesce(func.sum(runs_table.c.cost_usd), 0).desc())
+            .group_by(runs_table.c.workspace, runs_table.c.model)
         ).mappings().fetchall()
 
-        if ws_rows:
-            click.echo(f"\n{'Workspace':<25} {'Runs':>6} {'Total':>10} {'Avg':>10}")
-            click.echo("-" * 55)
-            for r in ws_rows:
-                click.echo(
-                    f"{(r['workspace'] or '?'):<25} {r['runs']:>6} "
-                    f"{_fmt_cost(r['total']):>10} {_fmt_cost(r['avg']):>10}"
-                )
-
-        # Cost by task type
-        type_rows = conn.execute(
-            select(
-                runs_table.c.task_type,
-                func.count().label("runs"),
-                func.coalesce(func.sum(runs_table.c.cost_usd), 0).label("total"),
-                func.avg(runs_table.c.cost_usd).label("avg"),
-            ).where(and_(*base_conds))
-            .group_by(runs_table.c.task_type)
-            .order_by(func.coalesce(func.sum(runs_table.c.cost_usd), 0).desc())
-        ).mappings().fetchall()
-
-        if type_rows:
-            click.echo(f"\n{'Task Type':<25} {'Runs':>6} {'Total':>10} {'Avg':>10}")
-            click.echo("-" * 55)
-            for r in type_rows:
-                click.echo(
-                    f"{(r['task_type'] or 'other'):<25} {r['runs']:>6} "
-                    f"{_fmt_cost(r['total']):>10} {_fmt_cost(r['avg']):>10}"
-                )
-
-        # Waste: runs with DQI < 0.5
-        waste_join = runs_table.join(
-            evaluations_table,
-            and_(evaluations_table.c.run_id == runs_table.c.id,
-                 evaluations_table.c.eval_type == "dqi"),
-        )
-        waste_conds = list(base_conds) + [evaluations_table.c.score < 0.5]
-
-        waste = conn.execute(
-            select(
-                func.count().label("waste_runs"),
-                func.coalesce(func.sum(runs_table.c.cost_usd), 0).label("waste_cost"),
-            ).select_from(waste_join).where(and_(*waste_conds))
-        ).mappings().fetchone()
-
-        waste_runs = waste["waste_runs"]
-        waste_cost = waste["waste_cost"] or 0
-        waste_pct = (waste_cost / total_spend * 100) if total_spend > 0 else 0
-
-        click.echo(f"\nWaste (DQI < 0.5)")
-        click.echo("-" * 40)
-        click.echo(f"Wasteful runs:  {waste_runs}")
-        click.echo(f"Wasted cost:    {_fmt_cost(waste_cost)} ({waste_pct:.1f}% of total)")
-
-        # Top 5 most expensive runs
-        top_rows = conn.execute(
-            select(
-                runs_table.c.id, runs_table.c.workspace, runs_table.c.task_type,
-                runs_table.c.cost_usd, runs_table.c.started_at,
-            ).where(and_(*base_conds, runs_table.c.cost_usd.isnot(None)))
-            .order_by(runs_table.c.cost_usd.desc())
-            .limit(5)
-        ).mappings().fetchall()
-
-        if top_rows:
-            click.echo(f"\nTop 5 Most Expensive Runs")
-            click.echo(f"{'Run ID':<12} {'Workspace':<18} {'Task Type':<12} {'Cost':>8} {'Date':<12}")
-            click.echo("-" * 66)
-            for r in top_rows:
-                click.echo(
-                    f"{(r['id'] or '?')[:10]:<12} "
-                    f"{(r['workspace'] or '?')[:16]:<18} "
-                    f"{(r['task_type'] or 'other')[:10]:<12} "
-                    f"{_fmt_cost(r['cost_usd']):>8} "
-                    f"{(r['started_at'] or '')[:10]:<12}"
-                )
-
-        click.echo()
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
-# dqi incidents
-# ---------------------------------------------------------------------------
-
-@cli.command()
-@click.option("--workspace", default=None, help="Filter by workspace")
-@click.option("--status", "status_filter", default=None,
-              help="Filter by status (e.g. detected, confirmed, resolved)")
-@click.option("--all", "show_all", is_flag=True, default=False,
-              help="Show all incidents including resolved")
-def incidents(workspace: str | None, status_filter: str | None, show_all: bool):
-    """Show active incidents."""
-    conn, config = _get_conn()
-    try:
-        from qualito.core.db import get_incidents
-
-        if show_all:
-            inc_status = None
-        elif status_filter:
-            inc_status = status_filter
-        else:
-            # Default: show non-resolved
-            inc_status = None  # We'll filter manually
-
-        rows = get_incidents(
-            conn,
-            workspace=workspace,
-            status=inc_status if status_filter else None,
-        )
-
-        # If not show_all and no explicit status, filter out resolved
-        if not show_all and not status_filter:
-            rows = [r for r in rows if r.get("status") not in ("resolved", "auto_resolved", "false_positive")]
-
-        if not rows:
-            click.echo("No incidents found.")
+        if not ws_model_rows:
+            click.echo(f"\nNo cost data in the last {days} days.")
+            if workspace:
+                click.echo(f"  (filtered by workspace: {workspace})")
+            click.echo()
             return
 
-        click.echo(f"\nIncidents ({len(rows)} found)")
-        click.echo("=" * 110)
-        click.echo(
-            f"{'ID':>4} {'Sev':<9} {'Title':<35} {'Workspace':<16} "
-            f"{'Status':<14} {'Affected':>8} {'Cost':>8} {'Since':<12}"
+        def _cost_for_row(model, input_t, output_t, cache_read_t, raw_cost):
+            if not correct:
+                return float(raw_cost or 0)
+            pricing = MODEL_PRICING.get(model or "", DEFAULT_PRICING)
+            return _compute_cost(pricing, input_t or 0, output_t or 0, cache_read_t or 0, True)
+
+        enriched = []
+        for r in ws_model_rows:
+            c = _cost_for_row(r["model"], r["input"], r["output"], r["cache_read"], r["raw_cost"])
+            enriched.append({
+                "workspace": r["workspace"] or "?",
+                "model": r["model"] or "unknown",
+                "runs": r["runs"],
+                "input": r["input"],
+                "output": r["output"],
+                "cache_read": r["cache_read"],
+                "cost": c,
+            })
+
+        total_runs = sum(r["runs"] for r in enriched)
+        total_input = sum(r["input"] for r in enriched)
+        total_output = sum(r["output"] for r in enriched)
+        total_cache_read = sum(r["cache_read"] for r in enriched)
+        total_cost = sum(r["cost"] for r in enriched)
+        avg_per_run = total_cost / total_runs if total_runs > 0 else 0
+
+        # Collapse to per-workspace
+        by_ws: dict[str, dict] = {}
+        for r in enriched:
+            w = r["workspace"]
+            d = by_ws.setdefault(w, {"runs": 0, "input": 0, "output": 0, "cache_read": 0, "cost": 0})
+            d["runs"] += r["runs"]
+            d["input"] += r["input"]
+            d["output"] += r["output"]
+            d["cache_read"] += r["cache_read"]
+            d["cost"] += r["cost"]
+        ws_list = sorted(
+            [{"workspace": k, **v} for k, v in by_ws.items()],
+            key=lambda x: x["cost"], reverse=True,
         )
-        click.echo("-" * 110)
 
-        for r in rows:
-            title = (r.get("title") or "?")[:33]
-            ws = (r.get("workspace") or "?")[:14]
-            sev = (r.get("severity") or "?")[:7]
-            st = (r.get("status") or "?")[:12]
-            affected = r.get("total_affected_runs") or 0
-            cost = r.get("cost_impact_usd")
-            since = (r.get("created_at") or "")[:10]
+        # Collapse to per-model
+        by_model: dict[str, dict] = {}
+        for r in enriched:
+            m = r["model"]
+            d = by_model.setdefault(m, {"runs": 0, "input": 0, "output": 0, "cache_read": 0, "cost": 0})
+            d["runs"] += r["runs"]
+            d["input"] += r["input"]
+            d["output"] += r["output"]
+            d["cache_read"] += r["cache_read"]
+            d["cost"] += r["cost"]
+        model_list = sorted(
+            [{"model": k, **v} for k, v in by_model.items()],
+            key=lambda x: x["cost"], reverse=True,
+        )
 
+        # Top-N most expensive. In --correct mode, fetch extra and re-sort
+        # client-side since 1.9x on output can reshuffle the order.
+        fetch_limit = top * 3 if correct else top
+        top_rows = conn.execute(
+            select(
+                runs_table.c.id,
+                runs_table.c.workspace,
+                runs_table.c.model,
+                runs_table.c.task,
+                runs_table.c.input_tokens,
+                runs_table.c.output_tokens,
+                runs_table.c.cache_read_tokens,
+                runs_table.c.cost_usd,
+                runs_table.c.started_at,
+            ).where(and_(*base_conds))
+            .order_by(runs_table.c.cost_usd.desc())
+            .limit(fetch_limit)
+        ).mappings().fetchall()
+
+        top_sessions = []
+        for r in top_rows:
+            c = _cost_for_row(
+                r["model"], r["input_tokens"], r["output_tokens"],
+                r["cache_read_tokens"], r["cost_usd"],
+            )
+            top_sessions.append({
+                "workspace": r["workspace"] or "?",
+                "model": r["model"] or "unknown",
+                "task": r["task"] or "",
+                "output": r["output_tokens"] or 0,
+                "cost": c,
+                "started_at": r["started_at"] or "",
+            })
+        top_sessions.sort(key=lambda x: x["cost"], reverse=True)
+        top_sessions = top_sessions[:top]
+
+        # ------------------------------------------------------------------
+        # Render
+        # ------------------------------------------------------------------
+        def fmt_c(v: float) -> str:
+            base = f"~{_fmt_cost(v)}"
+            return f"{base} (corrected)" if correct else base
+
+        click.echo(f"\nQualito Costs — last {days} days")
+        if workspace:
+            click.echo(f"Workspace: {workspace}")
+        click.echo()
+        click.echo(
+            f"Total: {fmt_c(total_cost)}   {total_runs} sessions   "
+            f"{fmt_c(avg_per_run)} avg/run"
+        )
+        click.echo(
+            f"Tokens: ~{_fmt_tokens(total_input)} in   "
+            f"~{_fmt_tokens(total_output)} out   "
+            f"~{_fmt_tokens(total_cache_read)} cache_read"
+        )
+
+        # By workspace
+        click.echo()
+        click.echo("By workspace")
+        click.echo(
+            f"  {'workspace':<22} {'sessions':>8}   "
+            f"{'in / out tokens':<20}   {'cost':<22} {'avg/run'}"
+        )
+        for r in ws_list:
+            in_out = f"{_fmt_tokens(r['input'])} / {_fmt_tokens(r['output'])}"
+            avg = r["cost"] / r["runs"] if r["runs"] > 0 else 0
             click.echo(
-                f"{r.get('id', '?'):>4} {sev:<9} {title:<35} {ws:<16} "
-                f"{st:<14} {affected:>8} {_fmt_cost(cost):>8} {since:<12}"
+                f"  {r['workspace'][:22]:<22} {r['runs']:>8}   "
+                f"{in_out:<20}   {fmt_c(r['cost']):<22} {fmt_c(avg)}"
             )
 
+        # By model
         click.echo()
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
-# dqi slo
-# ---------------------------------------------------------------------------
-
-@cli.command()
-@click.option("--workspace", default=None, help="Filter by workspace")
-@click.option("--days", default=30, help="Lookback period in days (default: 30)")
-def slo(workspace: str | None, days: int):
-    """Show SLO compliance."""
-    conn, config = _get_conn()
-    try:
-        since = _since_date(days)
-        base_conds = [runs_table.c.started_at >= since]
-        if workspace:
-            base_conds.append(runs_table.c.workspace == workspace)
-
-        # Load SLO targets from config
-        slo_quality_threshold = config.slo_quality  # e.g. 0.60
-        slo_avail_target = config.slo_availability  # e.g. 0.95
-        slo_cost_threshold = config.slo_cost  # e.g. 3.00
-
-        # Total runs
-        total_row = conn.execute(
-            select(
-                func.count().label("total"),
-                func.sum(case((runs_table.c.status == "completed", 1), else_=0)).label("completed"),
-                func.sum(case((runs_table.c.cost_usd < slo_cost_threshold, 1), else_=0)).label("under_cost"),
-            ).where(and_(*base_conds))
-        ).mappings().fetchone()
-
-        total = total_row["total"] or 0
-        completed = total_row["completed"] or 0
-        under_cost = total_row["under_cost"] or 0
-
-        # Quality: runs with DQI >= threshold
-        join = evaluations_table.join(runs_table, evaluations_table.c.run_id == runs_table.c.id)
-        quality_conds = list(base_conds) + [evaluations_table.c.eval_type == "dqi"]
-
-        quality_row = conn.execute(
-            select(
-                func.count().label("total_scored"),
-                func.sum(case((evaluations_table.c.score >= slo_quality_threshold, 1), else_=0)).label("quality_ok"),
-            ).select_from(join).where(and_(*quality_conds))
-        ).mappings().fetchone()
-
-        total_scored = quality_row["total_scored"] or 0
-        quality_ok = quality_row["quality_ok"] or 0
-
-        # Compute percentages
-        quality_pct = (quality_ok / total_scored) if total_scored > 0 else None
-        avail_pct = (completed / total) if total > 0 else None
-        cost_pct = (under_cost / total) if total > 0 else None
-
-        click.echo(f"\nSLO Compliance (last {days} days)")
-        click.echo("=" * 65)
+        click.echo("By model")
         click.echo(
-            f"{'SLO':<20} {'Current':>10} {'Target':>10} {'Status':>10}"
+            f"  {'model':<26} {'sessions':>8}   "
+            f"{'in / out':<20}   {'cost':<22} {'%':>5}"
         )
-        click.echo("-" * 65)
+        for r in model_list:
+            in_out = f"{_fmt_tokens(r['input'])} / {_fmt_tokens(r['output'])}"
+            pct = (r["cost"] / total_cost * 100) if total_cost > 0 else 0
+            click.echo(
+                f"  {r['model'][:26]:<26} {r['runs']:>8}   "
+                f"{in_out:<20}   {fmt_c(r['cost']):<22} {pct:>4.0f}%"
+            )
 
-        # Quality
-        q_current = _fmt_pct(quality_pct * 100) if quality_pct is not None else "N/A"
-        q_target = _fmt_pct(slo_quality_threshold * 100)
-        q_pass = quality_pct is not None and quality_pct >= slo_quality_threshold
-        q_status = "PASS" if q_pass else ("FAIL" if quality_pct is not None else "N/A")
-        click.echo(f"{'Quality':<20} {q_current:>10} {q_target:>10} {q_status:>10}")
-
-        # Availability
-        a_current = _fmt_pct(avail_pct * 100) if avail_pct is not None else "N/A"
-        a_target = _fmt_pct(slo_avail_target * 100)
-        a_pass = avail_pct is not None and avail_pct >= slo_avail_target
-        a_status = "PASS" if a_pass else ("FAIL" if avail_pct is not None else "N/A")
-        click.echo(f"{'Availability':<20} {a_current:>10} {a_target:>10} {a_status:>10}")
-
-        # Cost
-        c_current = _fmt_pct(cost_pct * 100) if cost_pct is not None else "N/A"
-        c_target = f"<{_fmt_cost(slo_cost_threshold)}"
-        c_pass = cost_pct is not None and cost_pct >= 0.80  # 80% of runs under threshold
-        c_status = "PASS" if c_pass else ("FAIL" if cost_pct is not None else "N/A")
-        click.echo(f"{'Cost':<20} {c_current:>10} {c_target:>10} {c_status:>10}")
-
-        click.echo("-" * 65)
-
-        # Overall
-        all_pass = q_pass and a_pass and c_pass
-        if total == 0:
-            click.echo("No runs found — cannot assess SLO compliance.")
-        else:
-            click.echo(f"Overall: {'ALL PASS' if all_pass else 'NOT MET'}  ({total} runs)")
-
-        # Per-workspace breakdown (only when no workspace filter)
-        if not workspace:
-            ws_rows = conn.execute(
-                select(runs_table.c.workspace.distinct())
-                .where(runs_table.c.started_at >= since)
-                .order_by(runs_table.c.workspace)
-            ).mappings().fetchall()
-
-            if len(ws_rows) > 1:
-                click.echo(f"\nPer-Workspace Breakdown")
+        # Top N
+        if top_sessions:
+            click.echo()
+            click.echo(f"Top {len(top_sessions)} most expensive sessions")
+            click.echo(
+                f"  {'date':<12} {'workspace':<18} {'model':<22} "
+                f"{'out tokens':>10}   {'cost':<22} task"
+            )
+            for r in top_sessions:
+                date = (r["started_at"] or "")[:10]
+                task = (r["task"] or "").replace("\n", " ")[:40]
                 click.echo(
-                    f"{'Workspace':<25} {'Quality':>10} {'Avail':>10} {'Cost':>10}"
+                    f"  {date:<12} {r['workspace'][:18]:<18} "
+                    f"{r['model'][:22]:<22} "
+                    f"{_fmt_tokens(r['output']):>10}   "
+                    f"{fmt_c(r['cost']):<22} \"{task}\""
                 )
-                click.echo("-" * 60)
 
-                for ws_row in ws_rows:
-                    ws_name = ws_row["workspace"]
-                    ws_conds = [runs_table.c.started_at >= since, runs_table.c.workspace == ws_name]
-
-                    # Quality for this workspace
-                    wq = conn.execute(
-                        select(
-                            func.count().label("total_scored"),
-                            func.sum(case((evaluations_table.c.score >= slo_quality_threshold, 1), else_=0)).label("ok"),
-                        ).select_from(join).where(and_(
-                            evaluations_table.c.eval_type == "dqi", *ws_conds
-                        ))
-                    ).mappings().fetchone()
-
-                    ws_q = (
-                        _fmt_pct(wq["ok"] / wq["total_scored"] * 100)
-                        if wq["total_scored"] > 0 else "N/A"
-                    )
-
-                    # Availability for this workspace
-                    wa = conn.execute(
-                        select(
-                            func.count().label("total"),
-                            func.sum(case((runs_table.c.status == "completed", 1), else_=0)).label("ok"),
-                        ).where(and_(*ws_conds))
-                    ).mappings().fetchone()
-
-                    ws_a = (
-                        _fmt_pct(wa["ok"] / wa["total"] * 100)
-                        if wa["total"] > 0 else "N/A"
-                    )
-
-                    # Cost for this workspace
-                    wc = conn.execute(
-                        select(
-                            func.count().label("total"),
-                            func.sum(case((runs_table.c.cost_usd < slo_cost_threshold, 1), else_=0)).label("ok"),
-                        ).where(and_(*ws_conds))
-                    ).mappings().fetchone()
-
-                    ws_c = (
-                        _fmt_pct(wc["ok"] / wc["total"] * 100)
-                        if wc["total"] > 0 else "N/A"
-                    )
-
-                    click.echo(f"{ws_name[:23]:<25} {ws_q:>10} {ws_a:>10} {ws_c:>10}")
-
+        # Disclaimer
+        click.echo()
+        if correct:
+            click.echo("⚠  Showing CORRECTED costs (output_tokens × 1.9 to compensate for upstream")
+            click.echo("   undercount). This is an estimate, not authoritative. Compare to your")
+            click.echo("   Anthropic billing dashboard for true totals.")
+            click.echo("   Use `qualito costs` (no flag) to see raw recorded values.")
+        else:
+            click.echo("⚠  About these numbers")
+            click.echo("   Cost is computed from token counts in Claude Code session files. Those")
+            click.echo("   files have a known upstream bug: output_tokens are recorded as mid-stream")
+            click.echo("   snapshots instead of final values, causing a ~1.9x undercount. Only")
+            click.echo("   output_tokens is affected — input_tokens and cache_read are accurate.")
+            click.echo()
+            click.echo("   Bug report (auto-closed without a fix on 2026-03-24):")
+            click.echo("     https://github.com/anthropics/claude-code/issues/27361")
+            click.echo()
+            click.echo("   Practical impact: for Opus-heavy workspaces, true spend is typically")
+            click.echo("   30-50% higher than shown. Opus output costs 5x more per token than")
+            click.echo("   input, so the (undercounted) output portion dominates total cost.")
+            click.echo()
+            click.echo("   Use `qualito costs --correct` to apply a 1.9x correction to output_tokens")
+            click.echo("   and recompute. The result is an estimate, not authoritative — your")
+            click.echo("   Anthropic billing dashboard is the only true source of total spend.")
+            click.echo("   Use `qualito costs --explain` for the full pricing breakdown.")
         click.echo()
     finally:
         conn.close()
@@ -1413,7 +1434,7 @@ def slo(workspace: str | None, days: int):
 # dqi login
 # ---------------------------------------------------------------------------
 
-@cli.command()
+@cli.command(help="Authenticate with the Qualito cloud")
 @click.option("--api-key", default=None, help="API key (skips browser flow)")
 @click.option("--api-url", default=None, help="API URL (default: https://api.dqi.dev)")
 def login(api_key: str | None, api_url: str | None):
@@ -1450,7 +1471,7 @@ def login(api_key: str | None, api_url: str | None):
 # dqi logout
 # ---------------------------------------------------------------------------
 
-@cli.command()
+@cli.command(help="Remove cloud credentials")
 def logout():
     """Remove Qualito cloud credentials."""
     from qualito.cloud import delete_credentials
@@ -1465,15 +1486,129 @@ def logout():
 # dqi sync
 # ---------------------------------------------------------------------------
 
-@cli.command()
-@click.option("--since", default=None, help="Sync runs since date (ISO format)")
-@click.option("--all", "sync_all", is_flag=True, help="Sync all runs")
-@click.option("--workspace", "workspaces", multiple=True, help="Workspace(s) to sync (repeatable)")
-def sync(since: str | None, sync_all: bool, workspaces: tuple[str, ...]):
-    """Sync local data to the Qualito cloud."""
-    import urllib.request
 
-    from qualito.cloud import CloudError, load_credentials, sync_incidents, sync_runs
+def _render_workspace_limit_error(err) -> None:
+    """Print the parsed workspace_limit 403 detail in the target format."""
+    click.echo(f"Sync failed: {err}")
+    if err.current_workspaces:
+        click.echo(f"  Currently synced: {', '.join(err.current_workspaces)}")
+    if err.attempted_workspaces:
+        click.echo(f"  Tried to add:     {', '.join(err.attempted_workspaces)}")
+    click.echo("")
+    click.echo(f"  Upgrade: {err.upgrade_url}")
+
+
+def _run_sync_with_progress(
+    conn,
+    selected_workspaces: list[str] | None,
+    since_date: str | None = None,
+    include_incidents: bool = True,
+) -> dict:
+    """Execute a sync with per-workspace progress output.
+
+    Shared by `qualito sync` and `qualito setup` so they render identical
+    progress. Handles CloudError and WorkspaceLimitError by printing the
+    parsed detail and exiting. Returns the run sync result dict on success.
+    """
+    from qualito.cloud import (
+        CloudError,
+        WorkspaceLimitError,
+        sync_incidents,
+        sync_runs,
+    )
+
+    # Pre-compute local session counts per workspace for header rendering.
+    count_stmt = select(runs_table.c.workspace, func.count().label("cnt"))
+    if since_date:
+        count_stmt = count_stmt.where(runs_table.c.started_at >= since_date)
+    if selected_workspaces:
+        count_stmt = count_stmt.where(runs_table.c.workspace.in_(selected_workspaces))
+    count_stmt = count_stmt.group_by(runs_table.c.workspace)
+    ws_counts = {row[0]: row[1] for row in conn.execute(count_stmt).fetchall()}
+
+    # Workspaces that actually have runs in scope. Empty selections should
+    # still succeed (with a "nothing to sync" result) rather than hanging.
+    effective_workspaces = (
+        [w for w in selected_workspaces if ws_counts.get(w, 0) > 0]
+        if selected_workspaces is not None
+        else [w for w, c in ws_counts.items() if c > 0]
+    )
+
+    if not effective_workspaces:
+        click.echo("Nothing to sync.")
+        return {"synced": 0, "skipped": 0, "errors": 0, "by_workspace": {}}
+
+    click.echo("")
+    click.echo("Syncing runs...")
+    click.echo("")
+
+    current_ws = {"name": None}
+
+    def on_batch(ws, batch_num, total_batches, count):
+        if current_ws["name"] != ws:
+            current_ws["name"] = ws
+            click.echo(f"  {ws} ({ws_counts.get(ws, 0)} sessions)")
+        click.echo(
+            f"    Batch {batch_num}/{total_batches} — sending {count} runs... ✓"
+        )
+
+    def on_workspace_done(ws, synced_count):
+        click.echo(f"  ✓ {ws} synced")
+        click.echo("")
+
+    try:
+        run_result = sync_runs(
+            conn,
+            since=since_date,
+            workspaces=selected_workspaces,
+            on_batch=on_batch,
+            on_workspace_done=on_workspace_done,
+        )
+    except WorkspaceLimitError as err:
+        _render_workspace_limit_error(err)
+        raise SystemExit(1)
+    except CloudError as err:
+        click.echo(f"Sync failed: {err}")
+        raise SystemExit(1)
+
+    if include_incidents:
+        try:
+            sync_incidents(conn)
+        except CloudError as err:
+            click.echo(f"Incidents sync failed: {err}")
+
+    synced_count = run_result.get("synced", 0)
+    by_ws = run_result.get("by_workspace", {})
+    synced_ws_count = sum(1 for c in by_ws.values() if c > 0)
+
+    click.echo(
+        f"Synced {synced_count} sessions across {synced_ws_count} workspaces."
+    )
+    click.echo("View at: https://app.qualito.ai/runs")
+    return run_result
+
+
+@cli.command(help="Push local sessions to the cloud dashboard")
+@click.option("--since", default=None, help="Sync runs since date (ISO format, non-interactive)")
+@click.option("--all", "sync_all", is_flag=True, help="Sync all runs (non-interactive)")
+@click.option(
+    "--workspace",
+    "workspaces",
+    multiple=True,
+    help="Workspace(s) to sync, repeatable (non-interactive)",
+)
+def sync(since: str | None, sync_all: bool, workspaces: tuple[str, ...]):
+    """Sync local data to the Qualito cloud.
+
+    With no flags: interactive picker that shows synced vs local-only workspaces.
+    With --all, --since, or --workspace: skips the picker.
+    """
+    from qualito.cloud import (
+        CloudError,
+        fetch_synced_workspaces,
+        fetch_user,
+        load_credentials,
+    )
 
     creds = load_credentials()
     if not creds:
@@ -1484,100 +1619,132 @@ def sync(since: str | None, sync_all: bool, workspaces: tuple[str, ...]):
     try:
         since_date = None if sync_all else since
 
-        # Determine which workspaces to sync
-        selected_workspaces: list[str] | None = list(workspaces) if workspaces else None
+        # ---------- Non-interactive paths: skip the picker ----------
+        if workspaces:
+            _run_sync_with_progress(conn, list(workspaces), since_date)
+            return
 
-        if selected_workspaces is None:
-            # No explicit workspaces — check plan limits
-            ws_rows = conn.execute(
-                select(
-                    runs_table.c.workspace,
-                    func.count().label("cnt"),
-                ).group_by(runs_table.c.workspace).order_by(runs_table.c.workspace)
-            ).fetchall()
-            all_ws = [row[0] for row in ws_rows]
-            ws_counts = {row[0]: row[1] for row in ws_rows}
+        if sync_all or since:
+            _run_sync_with_progress(conn, None, since_date)
+            return
 
-            if len(all_ws) > 3:
-                # Check if user is on free plan
-                is_free = True
-                api_url = creds.get("api_url", "https://api.qualito.ai")
-                api_key = creds.get("api_key", "")
-                try:
-                    me_req = urllib.request.Request(
-                        f"{api_url}/api/auth/me",
-                        method="GET",
-                    )
-                    me_req.add_header("Authorization", f"Bearer {api_key}")
-                    me_req.add_header("User-Agent", "qualito-cli")
-                    with urllib.request.urlopen(me_req, timeout=10) as me_resp:
-                        me_data = json.loads(me_resp.read().decode())
-                        if me_data.get("plan") == "pro":
-                            is_free = False
-                except Exception:
-                    pass
+        # ---------- Interactive picker ----------
+        try:
+            user_info = fetch_user()
+            synced_cloud = fetch_synced_workspaces()
+        except CloudError as err:
+            click.echo(f"Cannot reach cloud: {err}")
+            raise SystemExit(1)
 
-                if is_free:
-                    click.echo(
-                        "\nFree plan syncs up to 3 workspaces. "
-                        "Select which to sync:"
-                    )
-                    for i, ws in enumerate(all_ws, 1):
-                        click.echo(f"  [{i}] {ws} ({ws_counts[ws]} runs)")
-                    selection = click.prompt(
-                        "\nEnter numbers separated by commas (e.g. 1,2,3)",
-                        type=str,
-                    )
-                    indices = [
-                        int(s.strip()) for s in selection.split(",")
-                        if s.strip().isdigit()
-                    ]
-                    selected_workspaces = [
-                        all_ws[i - 1] for i in indices
-                        if 1 <= i <= len(all_ws)
-                    ][:3]
-                    if not selected_workspaces:
-                        click.echo("No valid workspaces selected. Skipping sync.")
-                        return
+        plan = (user_info.get("plan") or "free").lower()
+        is_free = plan != "pro"
+        limit = 3 if is_free else None
 
-        click.echo("Syncing runs...")
+        synced_meta = {
+            (w.get("workspace_name") or ""): w
+            for w in synced_cloud
+            if w.get("workspace_name")
+        }
+        synced_list = sorted(synced_meta.keys())
 
-        def _progress(batch_num, total_batches, runs_in_batch, status):
-            if status == "sending":
+        local_summaries = _get_workspace_summary(conn)
+        local_only = [
+            s
+            for s in local_summaries
+            if s.get("workspace") and s["workspace"] not in synced_meta
+        ]
+
+        at_limit = is_free and len(synced_list) >= (limit or 0)
+
+        plan_label = (
+            f"{plan} plan, {limit} workspace limit"
+            if is_free
+            else f"{plan} plan, unlimited workspaces"
+        )
+        click.echo(f"Cloud sync status ({plan_label})")
+        click.echo("")
+
+        # --- Already synced section ---
+        if is_free:
+            click.echo(f"Already synced ({len(synced_list)}/{limit}):")
+        else:
+            click.echo(f"Already synced ({len(synced_list)}):")
+        if synced_list:
+            for name in synced_list:
+                meta = synced_meta[name]
+                sc = int(meta.get("session_count") or 0)
+                last = _fmt_relative_time(meta.get("last_synced_at"))
                 click.echo(
-                    f"  Batch {batch_num}/{total_batches} — sending {runs_in_batch} runs...",
-                    nl=False,
+                    f"  ✓ {name[:16]:<16} {sc:>4} sessions   (last sync: {last})"
                 )
-            elif status == "done":
-                click.echo(" ✓")
-            elif status == "failed":
-                click.echo(" ✗")
+        else:
+            click.echo("  (none)")
+        click.echo("")
 
-        run_result = sync_runs(
-            conn, since=since_date, workspaces=selected_workspaces, progress_callback=_progress
-        )
+        # --- Local-only section ---
+        click.echo(f"Local only ({len(local_only)}):")
+        if local_only:
+            for i, s in enumerate(local_only, 1):
+                count = int(s.get("run_count") or 0)
+                prefix = "•" if at_limit else f"[{i}]"
+                click.echo(
+                    f"  {prefix} {(s['workspace'] or '')[:16]:<16} {count:>4} sessions"
+                )
+        else:
+            click.echo("  (none)")
+        click.echo("")
 
-        click.echo("Syncing incidents...")
-        inc_result = sync_incidents(conn)
+        # --- Pick workspaces to sync ---
+        selected_workspaces: list[str]
 
-        api_url = creds.get("api_url", "cloud")
-        click.echo(
-            f"\nSynced {run_result['synced']} runs, "
-            f"{inc_result['synced']} incidents to {api_url}"
-        )
-        if run_result["skipped"] or inc_result["skipped"]:
-            click.echo(
-                f"Skipped: {run_result['skipped']} runs, "
-                f"{inc_result['skipped']} incidents (already synced)"
-            )
-        if run_result["errors"] or inc_result["errors"]:
-            click.echo(
-                f"Errors: {run_result['errors']} runs, "
-                f"{inc_result['errors']} incidents"
-            )
-    except CloudError as e:
-        click.echo(f"Sync failed: {e}")
-        raise SystemExit(1)
+        if at_limit:
+            click.echo("Free plan is at the workspace limit. Options:")
+            click.echo("  [1] Sync new sessions to existing workspaces (default)")
+            click.echo("  [2] Upgrade to Pro for unlimited workspaces")
+            choice = click.prompt("\nChoose [1/2]", default="1")
+            choice = str(choice).strip()
+            if choice == "2":
+                click.echo("")
+                click.echo("Upgrade: https://app.qualito.ai/settings")
+                return
+            selected_workspaces = synced_list
+        else:
+            if not local_only:
+                if not synced_list:
+                    click.echo("No local workspaces to sync.")
+                    return
+                selected_workspaces = synced_list
+            else:
+                remaining = (limit - len(synced_list)) if is_free else None
+                hint = (
+                    f" (up to {remaining} more)"
+                    if remaining is not None and remaining > 0
+                    else ""
+                )
+                selection = click.prompt(
+                    f"Choose workspaces to add (by number, comma-separated, or 'none'){hint}",
+                    default="none",
+                )
+                sel_text = str(selection).strip().lower()
+                new_picks: list[str] = []
+                if sel_text not in ("none", ""):
+                    indices = _parse_selection(sel_text, len(local_only)) or []
+                    new_picks = [local_only[i]["workspace"] for i in indices]
+
+                if is_free and remaining is not None and len(new_picks) > remaining:
+                    click.echo(
+                        f"Free plan only allows {remaining} more workspace(s). "
+                        f"Keeping the first {remaining}."
+                    )
+                    new_picks = new_picks[:remaining]
+
+                selected_workspaces = synced_list + new_picks
+
+        if not selected_workspaces:
+            click.echo("Nothing to sync.")
+            return
+
+        _run_sync_with_progress(conn, selected_workspaces, since_date)
     finally:
         conn.close()
 
@@ -1586,7 +1753,7 @@ def sync(since: str | None, sync_all: bool, workspaces: tuple[str, ...]):
 # dqi dashboard
 # ---------------------------------------------------------------------------
 
-@cli.command()
+@cli.command(help="Launch the local web dashboard")
 @click.option("--port", default=8090, help="Port (default: 8090)")
 @click.option("--host", default="127.0.0.1", help="Host (default: 127.0.0.1)")
 def dashboard(port: int, host: str):

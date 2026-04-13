@@ -4,9 +4,6 @@ import json
 import sqlite3
 from pathlib import Path
 
-from click.testing import CliRunner
-
-from qualito.cli.main import cli
 from qualito.config import QualityConfig, get_global_dir, init_project, load_config
 from qualito.importer import (
     _folder_to_display_name,
@@ -111,31 +108,6 @@ def test_init_project_local_mode(tmp_path, monkeypatch):
     assert qualito_dir == project_dir / ".qualito"
     assert qualito_dir.is_dir()
     assert (qualito_dir / "config.toml").exists()
-
-
-# ---------------------------------------------------------------------------
-# CLI init with --local
-# ---------------------------------------------------------------------------
-
-
-def test_cli_init_global(tmp_path, monkeypatch):
-    """qualito init creates ~/.qualito/ by default."""
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init", "--dir", str(tmp_path)])
-    assert result.exit_code == 0
-    assert "global" in result.output
-    assert (tmp_path / ".qualito" / "config.toml").exists()
-
-
-def test_cli_init_local(tmp_path, monkeypatch):
-    """qualito init --local creates .qualito/ in project dir."""
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init", "--local", "--dir", str(tmp_path)])
-    assert result.exit_code == 0
-    assert "local" in result.output
-    assert (tmp_path / ".qualito" / "config.toml").exists()
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ from sqlalchemy import (
     MetaData,
     String,
     Table,
+    UniqueConstraint,
     and_,
     case,
     create_engine,
@@ -341,6 +342,18 @@ conversations_table = Table(
     Column("run_id", String, ForeignKey("runs.id"), nullable=False, unique=True),
     Column("messages", String, nullable=False),
     Column("message_count", Integer),
+)
+
+synced_workspaces_table = Table(
+    "synced_workspaces",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, ForeignKey("users.id"), nullable=False, index=True),
+    Column("workspace_name", String, nullable=False),
+    Column("first_synced_at", String, server_default=func.now()),
+    Column("last_synced_at", String, server_default=func.now()),
+    Column("session_count", Integer, server_default="0"),
+    UniqueConstraint("user_id", "workspace_name", name="uq_synced_workspaces_user_ws"),
 )
 
 # ---------------------------------------------------------------------------

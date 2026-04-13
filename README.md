@@ -48,18 +48,14 @@ qualito sync
 
 | Command | What it does |
 |---------|-------------|
-| `qualito init` | Initialize Qualito in your project |
-| `qualito import` | Import Claude Code session logs |
-| `qualito score` | Calculate DQI scores for imported runs |
-| `qualito status` | Show current DQI status |
-| `qualito costs` | Cost breakdown and waste analysis |
-| `qualito incidents` | Active quality incidents |
-| `qualito slo` | SLO compliance check |
-| `qualito reimport` | Re-import sessions with updated classification |
-| `qualito dashboard` | Launch local web dashboard |
-| `qualito login` | Authenticate with qualito.ai |
-| `qualito sync` | Push local data to cloud |
+| `qualito setup` | First-time setup: import sessions, configure MCP, optional cloud sync |
+| `qualito status` | See your local and cloud sync state |
+| `qualito import` | Import Claude Code sessions for measurement (`--force` to re-process) |
+| `qualito costs` | Analyze spending by workspace, model, and time |
+| `qualito sync` | Push local sessions to the cloud dashboard |
+| `qualito login` | Authenticate with the Qualito cloud |
 | `qualito logout` | Remove cloud credentials |
+| `qualito dashboard` | Launch the local web dashboard |
 
 ## MCP Server
 
@@ -76,7 +72,7 @@ Use Qualito inline in your editor via MCP:
 }
 ```
 
-8 tools available: `qualito_setup`, `dqi_score`, `dqi_cost`, `dqi_patterns`, `dqi_warnings`, `dqi_templates`, `dqi_incidents`, `dqi_slo`.
+Tools available: `qualito_setup`, `dqi_cost`, `dqi_patterns`, `dqi_warnings`, `dqi_templates`.
 
 ## Local Development
 

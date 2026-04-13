@@ -24,12 +24,13 @@ EXPECTED_TABLES = {
     "email_logs",
     "setup_tokens",
     "conversations",
+    "synced_workspaces",
 }
 
 
-def test_metadata_has_19_tables():
-    """metadata.tables has exactly 19 entries with correct names."""
-    assert len(metadata.tables) == 19
+def test_metadata_has_20_tables():
+    """metadata.tables has exactly 20 entries with correct names."""
+    assert len(metadata.tables) == 20
     assert set(metadata.tables.keys()) == EXPECTED_TABLES
 
 
@@ -71,7 +72,7 @@ def test_get_engine_explicit_path(tmp_path):
 
 
 def test_init_db_creates_all_tables(tmp_path):
-    """init_db creates all 18 tables in a fresh SQLite database."""
+    """init_db creates all tables in a fresh SQLite database."""
     db_file = str(tmp_path / "test.db")
     engine = get_engine(db_file)
     init_db(engine)
@@ -89,7 +90,7 @@ def test_init_db_idempotent(tmp_path):
     init_db(engine)  # Should not raise
 
     insp = inspect(engine)
-    assert len(insp.get_table_names()) == 19
+    assert len(insp.get_table_names()) == 20
 
 
 def test_init_db_returns_engine(tmp_path):
@@ -112,6 +113,7 @@ def test_runs_table_columns():
         "paper_live_gap", "skill_name", "source", "prompt_components",
         "user_id", "session_type", "entrypoint", "claude_version",
         "session_name", "has_subagents", "subagent_count", "error_count",
+        "tool_count",
     }
     assert cols == expected
 
