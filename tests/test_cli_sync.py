@@ -205,6 +205,8 @@ class TestSyncRunsLoop:
         calls = []
 
         def fake_cloud_request(method, path, data=None, timeout=30):
+            if "/privacy" in path:
+                return {"workspace_name": path.split("/")[-2], "sync_content": True, "allow_llm": False}
             calls.append({"path": path, "runs": [r["id"] for r in data["runs"]]})
             return {"synced": len(data["runs"]), "skipped": 0, "errors": 0}
 
@@ -279,6 +281,8 @@ class TestSyncRunsLoop:
         batches_seen = []
 
         def fake_cloud_request(method, path, data=None, timeout=30):
+            if "/privacy" in path:
+                return {"workspace_name": "mega", "sync_content": True, "allow_llm": False}
             batches_seen.append(len(data["runs"]))
             return {"synced": len(data["runs"]), "skipped": 0, "errors": 0}
 

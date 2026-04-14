@@ -80,6 +80,18 @@ class WorkspaceLimitError(CloudError):
         self.upgrade_url = upgrade_url
 
 
+class SecretsDetectedError(CloudError):
+    """Raised when pre-sync scanning finds potential secrets in runs.
+
+    findings_by_run maps run_id -> list[Finding], so the CLI can show
+    users which runs are affected and offer skip/abort/review options.
+    """
+
+    def __init__(self, message: str, findings_by_run: dict[str, list]):
+        super().__init__(message, status_code=None)
+        self.findings_by_run = findings_by_run
+
+
 def _parse_403_detail(body_text: str) -> CloudError:
     """Parse a 403 response body into the most specific exception we can.
 
@@ -240,19 +252,56 @@ def fetch_synced_workspaces() -> list[dict]:
     return result.get("workspaces", [])
 
 
+def fetch_workspace_privacy(workspace: str) -> dict:
+    """Fetch per-workspace privacy setting.
+
+    Returns {workspace_name, sync_content, allow_llm}. Defaults to
+    {sync_content: False, allow_llm: False} if no row exists (404).
+    """
+    try:
+        return cloud_request("GET", f"/api/sync/workspaces/{workspace}/privacy")
+    except CloudError as e:
+        if getattr(e, "status_code", None) == 404:
+            return {
+                "workspace_name": workspace,
+                "sync_content": False,
+                "allow_llm": False,
+            }
+        raise
+
+
+def set_workspace_privacy(
+    workspace: str, sync_content: bool, allow_llm: bool | None = None
+) -> dict:
+    """Upsert per-workspace privacy setting via PATCH.
+
+    allow_llm=None means leave unchanged (server supports partial updates).
+    """
+    payload: dict = {"sync_content": sync_content}
+    if allow_llm is not None:
+        payload["allow_llm"] = allow_llm
+    return cloud_request(
+        "PATCH", f"/api/sync/workspaces/{workspace}/privacy", data=payload
+    )
+
+
 def sync_runs(
     conn,
     since: str | None = None,
     workspaces: list[str] | None = None,
     on_batch=None,
     on_workspace_done=None,
+    exclude_runs: set[str] | None = None,
 ) -> dict:
     """Sync local runs to the cloud API, workspace-by-workspace.
 
     Runs are grouped by workspace and each workspace's runs are sent in
-    batches of 10. ``on_batch`` is called after every successful batch and
-    ``on_workspace_done`` fires once a workspace's batches all complete, so
-    the CLI can render per-workspace progress cleanly.
+    batches of 10. Before any upload, runs are scanned for secrets and each
+    workspace's privacy setting is fetched — workspaces with sync_content
+    disabled have their payloads stripped to metadata-only. ``on_batch`` is
+    called after every successful batch and ``on_workspace_done`` fires once
+    a workspace's batches all complete, so the CLI can render per-workspace
+    progress cleanly.
 
     Args:
         conn: Database connection (SA Connection).
@@ -265,16 +314,23 @@ def sync_runs(
             called after each successful batch.
         on_workspace_done: Optional callable(workspace, synced_count) called
             after all batches for a workspace finish successfully.
+        exclude_runs: Optional set of run IDs to drop before scanning and
+            upload. The CLI uses this to skip runs the user dismissed from
+            a secret-findings prompt.
 
     Returns:
         dict with keys: synced, skipped, errors, by_workspace (mapping
         workspace → synced_count).
 
     Raises:
+        SecretsDetectedError: when pre-sync scanning finds any secret in the
+            batched runs — raised before any /api/sync/runs POST.
         WorkspaceLimitError: when the server rejects the sync with a
             structured workspace_limit 403.
         CloudError: on other API or network errors.
     """
+    from qualito.core.secret_scanner import scan_run
+
     stmt = select(runs_table.c.id, runs_table.c.workspace).order_by(
         runs_table.c.workspace, runs_table.c.started_at
     )
@@ -293,6 +349,8 @@ def sync_runs(
         run_data = _collect_run_data(conn, row["id"])
         if not run_data:
             continue
+        if exclude_runs and run_data.get("id") in exclude_runs:
+            continue
         by_workspace.setdefault(ws, []).append(run_data)
 
     if not by_workspace:
@@ -305,6 +363,28 @@ def sync_runs(
     else:
         ordered = sorted(by_workspace.keys())
 
+    # Fetch per-workspace privacy settings before scanning so a 403/500 on
+    # the privacy endpoint fails fast — no runs leave the machine.
+    privacy_by_ws: dict[str, dict] = {
+        ws_name: fetch_workspace_privacy(ws_name) for ws_name in ordered
+    }
+
+    # Secret scan ALL runs regardless of workspace privacy — secrets block
+    # even metadata-only workspaces because findings live in text fields we
+    # would otherwise just strip silently.
+    findings_by_run: dict[str, list] = {}
+    for ws_name in ordered:
+        for run_data in by_workspace[ws_name]:
+            run_id = run_data.get("id")
+            findings = scan_run(run_data)
+            if findings:
+                findings_by_run[run_id] = findings
+
+    if findings_by_run:
+        raise SecretsDetectedError(
+            "Potential secrets detected in runs.", findings_by_run
+        )
+
     batch_size = 10
     total_synced = 0
     total_skipped = 0
@@ -315,6 +395,10 @@ def sync_runs(
         runs_for_ws = by_workspace[ws_name]
         if not runs_for_ws:
             continue
+
+        ws_privacy = privacy_by_ws.get(ws_name) or {}
+        if not ws_privacy.get("sync_content", False):
+            runs_for_ws = [_strip_run_to_metadata(r) for r in runs_for_ws]
 
         total_batches = (len(runs_for_ws) + batch_size - 1) // batch_size
         ws_synced = 0
