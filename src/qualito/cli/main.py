@@ -1750,6 +1750,227 @@ def sync(since: str | None, sync_all: bool, workspaces: tuple[str, ...]):
 
 
 # ---------------------------------------------------------------------------
+# qualito privacy
+# ---------------------------------------------------------------------------
+
+
+def _fmt_privacy_mode(enabled: bool) -> str:
+    """Render a privacy boolean as 'full content' or 'metadata only'."""
+    return "full content" if enabled else "metadata only"
+
+
+@cli.command(help="View or change per-workspace sync privacy settings")
+@click.argument("workspace", required=False)
+@click.option("--metadata", is_flag=True, default=False,
+              help="Set workspace to metadata-only sync")
+@click.option("--full", is_flag=True, default=False,
+              help="Set workspace to full content sync (requires confirmation)")
+@click.option("--allow-llm", is_flag=True, default=False,
+              help="Opt into LLM-based analysis (future Pro feature)")
+@click.option("--no-allow-llm", is_flag=True, default=False,
+              help="Opt out of LLM-based analysis")
+@click.option("--yes", "-y", is_flag=True, default=False,
+              help="Skip confirmation prompt for --full")
+def privacy(
+    workspace: str | None,
+    metadata: bool,
+    full: bool,
+    allow_llm: bool,
+    no_allow_llm: bool,
+    yes: bool,
+):
+    """View and change per-workspace sync privacy settings.
+
+    With no arguments: lists every synced workspace and its current privacy.
+    With WORKSPACE only: shows detail + options for that workspace.
+    With WORKSPACE --metadata | --full: changes sync_content mode.
+    With WORKSPACE --allow-llm | --no-allow-llm: toggles LLM analysis opt-in.
+    """
+    from qualito.cloud import (
+        CloudError,
+        fetch_synced_workspaces,
+        fetch_user,
+        fetch_workspace_privacy,
+        load_credentials,
+        set_workspace_privacy,
+    )
+
+    # Flag validation
+    if metadata and full:
+        raise click.UsageError("--metadata and --full are mutually exclusive.")
+    if allow_llm and no_allow_llm:
+        raise click.UsageError("--allow-llm and --no-allow-llm are mutually exclusive.")
+
+    setting_flags = metadata or full or allow_llm or no_allow_llm
+    if setting_flags and not workspace:
+        raise click.UsageError(
+            "workspace name required when setting privacy mode."
+        )
+
+    if not load_credentials():
+        click.echo("Not logged in. Run 'qualito login' first.")
+        raise SystemExit(1)
+
+    # Mode 3: change sync_content
+    if metadata or full:
+        try:
+            if metadata:
+                set_workspace_privacy(workspace, sync_content=False)
+                click.echo(f"OK. {workspace} is now metadata-only.")
+                return
+            # --full path
+            if not yes:
+                click.echo(
+                    f"This will sync prompts, tool outputs, and file paths to"
+                )
+                click.echo(
+                    f"https://app.qualito.ai for workspace '{workspace}'."
+                )
+                click.echo(
+                    "Use 'qualito audit secrets' to scan for accidental secrets before syncing."
+                )
+                if not click.confirm("Continue?", default=False):
+                    click.echo("Aborted. No changes.")
+                    return
+            set_workspace_privacy(workspace, sync_content=True)
+            click.echo(f"OK. {workspace} now syncs full content.")
+            return
+        except CloudError as err:
+            click.echo(f"Error: {err}", err=True)
+            raise SystemExit(1)
+
+    # Mode 4: toggle allow_llm without touching sync_content
+    if allow_llm or no_allow_llm:
+        try:
+            current = fetch_workspace_privacy(workspace)
+            new_allow = bool(allow_llm)
+            set_workspace_privacy(
+                workspace,
+                sync_content=bool(current.get("sync_content", False)),
+                allow_llm=new_allow,
+            )
+        except CloudError as err:
+            click.echo(f"Error: {err}", err=True)
+            raise SystemExit(1)
+        if new_allow:
+            click.echo(
+                f"OK. {workspace} allow_llm=true (no feature uses this yet; "
+                f"reserved for future Pro LLM-based analysis)."
+            )
+        else:
+            click.echo(f"OK. {workspace} allow_llm=false.")
+        return
+
+    # Mode 2: show single workspace detail
+    if workspace:
+        try:
+            data = fetch_workspace_privacy(workspace)
+        except CloudError as err:
+            if getattr(err, "status_code", None) == 404:
+                click.echo(
+                    f"Workspace '{workspace}' not yet synced. Run: qualito sync"
+                )
+                return
+            click.echo(f"Error: {err}", err=True)
+            raise SystemExit(1)
+
+        sync_content = bool(data.get("sync_content", False))
+        allow_llm_cur = bool(data.get("allow_llm", False))
+
+        click.echo(f"Workspace: {workspace}")
+        click.echo(f"  Sync content:  {_fmt_privacy_mode(sync_content)}")
+        click.echo(f"  LLM analysis:  {_fmt_privacy_mode(allow_llm_cur)}")
+        click.echo()
+        if sync_content:
+            click.echo(
+                "Full content means: everything syncs including prompts, tool"
+            )
+            click.echo(
+                "outputs, file paths, and task text."
+            )
+            click.echo()
+            click.echo("To change:")
+            click.echo(
+                f"  qualito privacy {workspace} --metadata    "
+                "(switch to metadata only)"
+            )
+            click.echo(
+                f"  qualito privacy {workspace} --allow-llm   "
+                "(opt into LLM analysis — future Pro feature)"
+            )
+        else:
+            click.echo(
+                "Metadata only means: counts, durations, types, scores, IDs, timestamps."
+            )
+            click.echo(
+                "It does NOT ship: task text, tool call outputs, file paths, prompts."
+            )
+            click.echo()
+            click.echo("To change:")
+            click.echo(
+                f"  qualito privacy {workspace} --full       "
+                "(opt into full content sync)"
+            )
+            click.echo(
+                f"  qualito privacy {workspace} --allow-llm  "
+                "(opt into LLM analysis — future Pro feature)"
+            )
+        return
+
+    # Mode 1: list all synced workspaces
+    try:
+        synced = fetch_synced_workspaces()
+    except CloudError as err:
+        click.echo(f"Error: {err}", err=True)
+        raise SystemExit(1)
+
+    if not synced:
+        click.echo("No synced workspaces yet. Run: qualito sync")
+        return
+
+    plan_label: str | None = None
+    try:
+        user_info = fetch_user()
+        plan = (user_info.get("plan") or "free").lower()
+        plan_label = f"{plan} plan"
+    except CloudError:
+        plan_label = None
+
+    header = "Workspace privacy"
+    if plan_label:
+        header += f" ({plan_label})"
+    click.echo(header)
+    click.echo()
+    click.echo(
+        f"{'Workspace':<16} {'Sync content':<16} "
+        f"{'LLM analysis':<16} Last changed"
+    )
+
+    for ws in synced:
+        name = str(ws.get("workspace_name") or "")
+        if not name:
+            continue
+        try:
+            data = fetch_workspace_privacy(name)
+        except CloudError as err:
+            click.echo(f"{name[:16]:<16} error: {err}")
+            continue
+        sync_content = bool(data.get("sync_content", False))
+        allow_llm_cur = bool(data.get("allow_llm", False))
+        last = _fmt_relative_time(ws.get("last_synced_at"))
+        click.echo(
+            f"{name[:16]:<16} {_fmt_privacy_mode(sync_content):<16} "
+            f"{_fmt_privacy_mode(allow_llm_cur):<16} {last}"
+        )
+
+    click.echo()
+    click.echo(
+        "Default: metadata only. Use 'qualito privacy <workspace> --full' "
+        "to share content."
+    )
+
+
+# ---------------------------------------------------------------------------
 # dqi dashboard
 # ---------------------------------------------------------------------------
 
