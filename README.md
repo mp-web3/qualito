@@ -70,9 +70,19 @@ qualito audit list   # flagged runs needing review
 ```
 
 For a web UI with charts and history, sync to the cloud and view at
-https://app.qualito.ai. Privacy is per-workspace and metadata-only by
-default — see docs/privacy.md for the full field-by-field breakdown
-(added by Phase 7 docs task).
+https://app.qualito.ai.
+
+## Privacy
+
+Qualito is local-first. Your session data lives on your machine, and you
+control what syncs to the cloud on a per-workspace basis.
+
+- Default: metadata only (counts, durations, types, scores)
+- Opt in per workspace to sync full content for a richer dashboard
+- Every sync scanned for secrets (AWS keys, API tokens, passwords, etc.)
+- Server enforces your stated settings — defense in depth
+
+See [docs/privacy.md](docs/privacy.md) for the full field-by-field breakdown.
 
 ## MCP Server
 
