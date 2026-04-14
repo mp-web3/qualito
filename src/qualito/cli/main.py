@@ -2210,6 +2210,281 @@ def privacy(
 
 
 # ---------------------------------------------------------------------------
+# audit — offline secret scanning + management of flagged runs
+# ---------------------------------------------------------------------------
+
+
+def _load_run_for_scan(conn, run_id: str) -> dict | None:
+    """Fetch a run plus its artifacts so the scanner can see every text field.
+
+    ``get_run`` returns tool_calls / file_activity / evaluations but not
+    artifacts — we pull those separately so the audit scan matches what the
+    sync scanner sees.
+    """
+    from qualito.core.db import get_artifacts, get_run
+
+    run = get_run(conn, run_id)
+    if not run:
+        return None
+    run["artifacts"] = get_artifacts(conn, run_id=run_id, limit=1000)
+    return run
+
+
+def _resolve_partial_run_id(conn, partial: str) -> str | None:
+    """Return the single run id matching ``partial``, or None if not unique.
+
+    Accepts either a full id or an 8+ char prefix. Returns None when there
+    is no match or more than one match so the caller can render the right
+    error.
+    """
+    rows = conn.execute(
+        select(runs_table.c.id).where(runs_table.c.id.like(f"{partial}%"))
+    ).fetchall()
+    if len(rows) == 1:
+        return rows[0][0]
+    return None
+
+
+@cli.group(name="audit", invoke_without_command=True)
+@click.pass_context
+def audit(ctx):
+    """Offline audit tools for runs containing potential secrets."""
+    if ctx.invoked_subcommand is not None:
+        return
+    click.echo("Usage: qualito audit <subcommand>")
+    click.echo("")
+    click.echo("Subcommands:")
+    click.echo("  secrets   Scan local runs for potential secrets interactively")
+    click.echo("  list      List runs that have been flagged locally")
+    click.echo("  unflag    Clear the flagged mark on a single run")
+    click.echo("  drop      Delete all locally flagged runs (cascade)")
+    click.echo("")
+    click.echo("Run 'qualito audit <subcommand> --help' for details.")
+
+
+@audit.command(name="secrets", help="Scan local runs for potential secrets")
+@click.option("--workspace", "-w", default=None, help="Only scan this workspace")
+@click.option("--since", default=None, help="Only scan runs started on/after this ISO date")
+def audit_secrets(workspace: str | None, since: str | None):
+    """Walk local runs through the secret scanner with an interactive review."""
+    from qualito.core.secret_scanner import scan_run
+
+    conn, _config = _get_conn()
+    try:
+        stmt = select(runs_table.c.id, runs_table.c.workspace, runs_table.c.task)
+        if workspace:
+            stmt = stmt.where(runs_table.c.workspace == workspace)
+        if since:
+            stmt = stmt.where(runs_table.c.started_at >= since)
+        stmt = stmt.order_by(runs_table.c.started_at.desc())
+        rows = conn.execute(stmt).mappings().fetchall()
+
+        if not rows:
+            click.echo("No runs to scan.")
+            return
+
+        click.echo(f"Scanning {len(rows)} run{'s' if len(rows) != 1 else ''} for secrets...")
+
+        flagged = 0
+        fp = 0
+        skipped = 0
+        quit_early = False
+        scanned = 0
+
+        for idx, row in enumerate(rows):
+            run_id = row["id"]
+            run = _load_run_for_scan(conn, run_id)
+            if not run:
+                continue
+            scanned += 1
+            findings = scan_run(run)
+            if not findings:
+                continue
+
+            finding = findings[0]
+            ws = (row["workspace"] or "")
+            task_full = ((row["task"] or "")).replace("\n", " ")
+            short_id = str(run_id)[:8]
+            task_display = task_full[:80]
+
+            click.echo("")
+            click.echo(f"Run: {short_id}")
+            click.echo(f"Workspace: {ws}")
+            click.echo(f"Task: '{task_display}'")
+            click.echo(f"Pattern: {finding.pattern_name}")
+            click.echo(f"Field: {finding.field_path}")
+            click.echo(f"Preview: {finding.match_preview}")
+            if len(findings) > 1:
+                click.echo(f"(+{len(findings) - 1} more finding(s) in this run)")
+            click.echo("")
+            action = str(
+                click.prompt(
+                    "Mark as [t]rue positive / [f]alse positive / [s]kip / [q]uit",
+                    default="s",
+                )
+            ).strip().lower()
+
+            if action == "t":
+                _flag_run_locally(
+                    conn, run_id, f"secret_detected:{finding.pattern_name}"
+                )
+                flagged += 1
+                continue
+            if action == "q":
+                quit_early = True
+                break
+            if action == "f":
+                fp += 1
+                continue
+            skipped += 1
+
+        click.echo("")
+        click.echo(
+            f"Scanned {scanned} run{'s' if scanned != 1 else ''}. "
+            f"Flagged: {flagged}, false positives: {fp}, skipped: {skipped}."
+        )
+        if quit_early:
+            click.echo("(Review quit early — remaining runs not shown.)")
+        if flagged:
+            click.echo("Use 'qualito audit list' to review flagged runs.")
+    finally:
+        conn.close()
+
+
+@audit.command(name="list", help="List locally flagged runs")
+@click.option("--workspace", "-w", default=None, help="Only list runs in this workspace")
+def audit_list(workspace: str | None):
+    """Show every run whose ``flagged`` column is true."""
+    conn, _config = _get_conn()
+    try:
+        stmt = select(
+            runs_table.c.id,
+            runs_table.c.workspace,
+            runs_table.c.task,
+            runs_table.c.flag_reason,
+        ).where(runs_table.c.flagged.is_(True))
+        if workspace:
+            stmt = stmt.where(runs_table.c.workspace == workspace)
+        stmt = stmt.order_by(runs_table.c.started_at.desc())
+        rows = conn.execute(stmt).mappings().fetchall()
+
+        if not rows:
+            click.echo("No flagged runs.")
+            return
+
+        click.echo(f"Flagged runs: {len(rows)}")
+        click.echo("")
+        click.echo(
+            f"{'Run ID':<10} {'Workspace':<16} {'Task':<42} Reason"
+        )
+        for row in rows:
+            short_id = str(row["id"] or "")[:8]
+            ws = (row["workspace"] or "")[:16]
+            task = ((row["task"] or "")).replace("\n", " ")[:40]
+            reason = (row["flag_reason"] or "")
+            click.echo(f"{short_id:<10} {ws:<16} {task:<42} {reason}")
+    finally:
+        conn.close()
+
+
+@audit.command(name="unflag", help="Clear the flagged mark on a run")
+@click.argument("run_id")
+def audit_unflag(run_id: str):
+    """Unflag a single run by full id or unique 8+ char prefix."""
+    from qualito.core.db import update_run
+
+    conn, _config = _get_conn()
+    try:
+        resolved = _resolve_partial_run_id(conn, run_id)
+        if not resolved:
+            click.echo(f"Run not found: {run_id}", err=True)
+            raise SystemExit(1)
+
+        row = conn.execute(
+            select(runs_table.c.flagged).where(runs_table.c.id == resolved)
+        ).mappings().fetchone()
+        if not row:
+            click.echo(f"Run not found: {run_id}", err=True)
+            raise SystemExit(1)
+        if not row["flagged"]:
+            click.echo(f"Run {resolved[:8]} is not flagged.")
+            return
+
+        update_run(conn, resolved, flagged=False, flag_reason=None)
+        click.echo(f"Unflagged run {resolved[:8]}.")
+    finally:
+        conn.close()
+
+
+@audit.command(name="drop", help="Delete all locally flagged runs (cascade)")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt")
+def audit_drop(yes: bool):
+    """Cascade-delete every flagged run and all of its child rows."""
+    from qualito.core.db import (
+        artifacts_table,
+        conversations_table,
+        evaluations_table,
+        file_activity_table,
+        tool_calls_table,
+    )
+
+    conn, _config = _get_conn()
+    try:
+        rows = conn.execute(
+            select(runs_table.c.id).where(runs_table.c.flagged.is_(True))
+        ).fetchall()
+        if not rows:
+            click.echo("No flagged runs to drop.")
+            return
+
+        ids_to_delete = [r[0] for r in rows]
+        n = len(ids_to_delete)
+
+        if not yes:
+            click.echo(
+                f"About to DELETE {n} flagged run{'s' if n != 1 else ''} "
+                f"and all of their child rows (tool_calls, file_activity, "
+                f"evaluations, artifacts, conversations)."
+            )
+            confirm = click.prompt("Type 'yes' to confirm", default="no")
+            if str(confirm).strip().lower() != "yes":
+                click.echo("Aborted. No changes.")
+                return
+
+        conn.execute(
+            tool_calls_table.delete().where(
+                tool_calls_table.c.run_id.in_(ids_to_delete)
+            )
+        )
+        conn.execute(
+            file_activity_table.delete().where(
+                file_activity_table.c.run_id.in_(ids_to_delete)
+            )
+        )
+        conn.execute(
+            evaluations_table.delete().where(
+                evaluations_table.c.run_id.in_(ids_to_delete)
+            )
+        )
+        conn.execute(
+            artifacts_table.delete().where(
+                artifacts_table.c.run_id.in_(ids_to_delete)
+            )
+        )
+        conn.execute(
+            conversations_table.delete().where(
+                conversations_table.c.run_id.in_(ids_to_delete)
+            )
+        )
+        conn.execute(runs_table.delete().where(runs_table.c.id.in_(ids_to_delete)))
+        conn.commit()
+
+        click.echo(f"Deleted {n} flagged run{'s' if n != 1 else ''}.")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # dqi dashboard
 # ---------------------------------------------------------------------------
 
