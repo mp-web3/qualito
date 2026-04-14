@@ -72,7 +72,12 @@ def _fake_login(monkeypatch, tmp_path: Path) -> Path:
 
 
 def _stub_sync_runs(monkeypatch, captured: list):
-    """Replace sync_runs with a stub that records call kwargs and fires callbacks."""
+    """Replace sync_runs with a stub that records call kwargs and fires callbacks.
+
+    Also stubs fetch_workspace_privacy to return a non-default row so the
+    CLI's first-sync prompt is silenced in tests that don't care about it.
+    Individual tests can override the privacy stub by patching again.
+    """
 
     def _stub(conn, **kwargs):
         captured.append(kwargs)
@@ -98,6 +103,17 @@ def _stub_sync_runs(monkeypatch, captured: list):
     # it lazily from qualito.cloud, so we patch the source module.
     monkeypatch.setattr(cloud_mod, "sync_runs", _stub, raising=True)
     monkeypatch.setattr(cloud_mod, "sync_incidents", lambda conn: {"synced": 0, "skipped": 0, "errors": 0}, raising=True)
+    monkeypatch.setattr(
+        cloud_mod,
+        "fetch_workspace_privacy",
+        lambda ws: {
+            "workspace_name": ws,
+            "sync_content": False,
+            "allow_llm": False,
+            "is_default": False,
+        },
+        raising=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -528,3 +544,341 @@ class TestSyncNonInteractive:
         result = runner.invoke(cli, ["sync"])
         assert result.exit_code == 1
         assert "Not logged in" in result.output
+
+
+# ---------------------------------------------------------------------------
+# First-sync privacy prompt + SecretsDetectedError handling
+# ---------------------------------------------------------------------------
+
+
+class TestSyncPrivacyAndSecrets:
+    """End-to-end coverage of the privacy prompt + SecretsDetectedError flow.
+
+    Uses --workspace=alpha to bypass the interactive picker so the tests
+    exercise _run_sync_with_progress on a single workspace.
+    """
+
+    def _setup(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.chdir(tmp_path)
+        init_project(project_dir=tmp_path, local=True)
+        db_path = tmp_path / ".qualito" / "qualito.db"
+        _seed_three_workspaces(db_path)
+        _fake_login(monkeypatch, tmp_path)
+        return db_path
+
+    def test_sync_first_sync_prompts_for_privacy(self, tmp_path, monkeypatch):
+        """is_default=True → [m/f] prompt appears, metadata choice persists before sync."""
+        self._setup(tmp_path, monkeypatch)
+
+        events: list = []
+
+        def _fake_fetch(ws):
+            return {
+                "workspace_name": ws,
+                "sync_content": False,
+                "allow_llm": False,
+                "is_default": True,
+            }
+
+        def _fake_set(ws, sync_content, allow_llm=None):
+            events.append(("set_privacy", ws, sync_content))
+            return {"workspace_name": ws, "sync_content": sync_content}
+
+        def _stub_sync(conn, **kwargs):
+            events.append(("sync_runs", kwargs))
+            return {"synced": 2, "skipped": 0, "errors": 0, "by_workspace": {"alpha": 2}}
+
+        monkeypatch.setattr(cloud_mod, "fetch_workspace_privacy", _fake_fetch, raising=True)
+        monkeypatch.setattr(cloud_mod, "set_workspace_privacy", _fake_set, raising=True)
+        monkeypatch.setattr(cloud_mod, "sync_runs", _stub_sync, raising=True)
+        monkeypatch.setattr(
+            cloud_mod,
+            "sync_incidents",
+            lambda conn: {"synced": 0, "skipped": 0, "errors": 0},
+            raising=True,
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["sync", "--workspace", "alpha"], input="m\n")
+        assert result.exit_code == 0, result.output
+        assert "first sync" in result.output
+        assert "[m] Metadata only" in result.output
+
+        # set_workspace_privacy must have been called with sync_content=False
+        set_events = [e for e in events if e[0] == "set_privacy"]
+        sync_events = [e for e in events if e[0] == "sync_runs"]
+        assert len(set_events) == 1
+        assert set_events[0] == ("set_privacy", "alpha", False)
+        assert len(sync_events) == 1
+        # Ordering: privacy saved BEFORE sync_runs fired
+        assert events.index(set_events[0]) < events.index(sync_events[0])
+
+    def test_sync_first_sync_full_mode_confirmation(self, tmp_path, monkeypatch):
+        """is_default=True + 'f' + 'y' → full-content warning and sync_content=True."""
+        self._setup(tmp_path, monkeypatch)
+
+        events: list = []
+
+        monkeypatch.setattr(
+            cloud_mod,
+            "fetch_workspace_privacy",
+            lambda ws: {
+                "workspace_name": ws,
+                "sync_content": False,
+                "allow_llm": False,
+                "is_default": True,
+            },
+            raising=True,
+        )
+
+        def _fake_set(ws, sync_content, allow_llm=None):
+            events.append(("set_privacy", ws, sync_content))
+            return {"workspace_name": ws, "sync_content": sync_content}
+
+        def _stub_sync(conn, **kwargs):
+            events.append(("sync_runs", kwargs))
+            return {"synced": 2, "skipped": 0, "errors": 0, "by_workspace": {"alpha": 2}}
+
+        monkeypatch.setattr(cloud_mod, "set_workspace_privacy", _fake_set, raising=True)
+        monkeypatch.setattr(cloud_mod, "sync_runs", _stub_sync, raising=True)
+        monkeypatch.setattr(
+            cloud_mod,
+            "sync_incidents",
+            lambda conn: {"synced": 0, "skipped": 0, "errors": 0},
+            raising=True,
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli, ["sync", "--workspace", "alpha"], input="f\ny\n"
+        )
+        assert result.exit_code == 0, result.output
+        assert "sync prompts, tool outputs" in result.output
+        assert "qualito audit secrets" in result.output
+
+        set_events = [e for e in events if e[0] == "set_privacy"]
+        assert set_events == [("set_privacy", "alpha", True)]
+
+    def test_sync_respects_existing_privacy(self, tmp_path, monkeypatch):
+        """is_default=False → no prompt, set_workspace_privacy NOT called."""
+        self._setup(tmp_path, monkeypatch)
+
+        set_calls: list = []
+
+        monkeypatch.setattr(
+            cloud_mod,
+            "fetch_workspace_privacy",
+            lambda ws: {
+                "workspace_name": ws,
+                "sync_content": True,
+                "allow_llm": False,
+                "is_default": False,
+            },
+            raising=True,
+        )
+        monkeypatch.setattr(
+            cloud_mod,
+            "set_workspace_privacy",
+            lambda *a, **kw: set_calls.append((a, kw)),
+            raising=True,
+        )
+
+        def _stub_sync(conn, **kwargs):
+            return {"synced": 2, "skipped": 0, "errors": 0, "by_workspace": {"alpha": 2}}
+
+        monkeypatch.setattr(cloud_mod, "sync_runs", _stub_sync, raising=True)
+        monkeypatch.setattr(
+            cloud_mod,
+            "sync_incidents",
+            lambda conn: {"synced": 0, "skipped": 0, "errors": 0},
+            raising=True,
+        )
+
+        runner = CliRunner()
+        # No input needed since no prompt should appear
+        result = runner.invoke(cli, ["sync", "--workspace", "alpha"])
+        assert result.exit_code == 0, result.output
+        assert "first sync" not in result.output
+        assert "[m] Metadata only" not in result.output
+        assert set_calls == []
+
+    def _raise_secrets_then_succeed(self, finding_run_id, finding):
+        """Factory: sync_runs stub that raises SecretsDetectedError once then succeeds."""
+        call_count = {"n": 0}
+        captured: list = []
+
+        def _stub(conn, **kwargs):
+            captured.append(kwargs)
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise cloud_mod.SecretsDetectedError(
+                    "Potential secrets detected in runs.",
+                    {finding_run_id: [finding]},
+                )
+            return {
+                "synced": 1,
+                "skipped": 0,
+                "errors": 0,
+                "by_workspace": {"alpha": 1},
+            }
+
+        return _stub, captured
+
+    def test_sync_secrets_detected_skip_flow(self, tmp_path, monkeypatch):
+        """[s] → second sync_runs call with exclude_runs={detected_run_id}."""
+        self._setup(tmp_path, monkeypatch)
+
+        from qualito.core.secret_scanner import Finding
+
+        finding = Finding(
+            pattern_name="aws_access_key",
+            field_path="runs.task",
+            match_preview="AKIAIO...",
+        )
+
+        _stub, captured = self._raise_secrets_then_succeed("alpha-0", finding)
+        monkeypatch.setattr(cloud_mod, "sync_runs", _stub, raising=True)
+        monkeypatch.setattr(
+            cloud_mod,
+            "sync_incidents",
+            lambda conn: {"synced": 0, "skipped": 0, "errors": 0},
+            raising=True,
+        )
+        monkeypatch.setattr(
+            cloud_mod,
+            "fetch_workspace_privacy",
+            lambda ws: {
+                "workspace_name": ws,
+                "sync_content": False,
+                "allow_llm": False,
+                "is_default": False,
+            },
+            raising=True,
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli, ["sync", "--workspace", "alpha"], input="s\n"
+        )
+        assert result.exit_code == 0, result.output
+        assert "Found potential secrets" in result.output
+        assert "aws_access_key" in result.output
+        assert len(captured) == 2
+        # First call had no exclusions
+        assert captured[0].get("exclude_runs") in (None, set())
+        # Second call excluded the detected run
+        assert captured[1]["exclude_runs"] == {"alpha-0"}
+        assert "were skipped due to detected secrets" in result.output
+
+    def test_sync_secrets_detected_abort_flow(self, tmp_path, monkeypatch):
+        """[a] → exit 1, sync_runs called only once."""
+        self._setup(tmp_path, monkeypatch)
+
+        from qualito.core.secret_scanner import Finding
+
+        finding = Finding(
+            pattern_name="stripe_live",
+            field_path="runs.task",
+            match_preview="sk_live_...",
+        )
+
+        call_count = {"n": 0}
+        captured: list = []
+
+        def _stub(conn, **kwargs):
+            captured.append(kwargs)
+            call_count["n"] += 1
+            raise cloud_mod.SecretsDetectedError(
+                "Potential secrets detected in runs.",
+                {"alpha-0": [finding]},
+            )
+
+        monkeypatch.setattr(cloud_mod, "sync_runs", _stub, raising=True)
+        monkeypatch.setattr(
+            cloud_mod,
+            "sync_incidents",
+            lambda conn: {"synced": 0, "skipped": 0, "errors": 0},
+            raising=True,
+        )
+        monkeypatch.setattr(
+            cloud_mod,
+            "fetch_workspace_privacy",
+            lambda ws: {
+                "workspace_name": ws,
+                "sync_content": False,
+                "allow_llm": False,
+                "is_default": False,
+            },
+            raising=True,
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli, ["sync", "--workspace", "alpha"], input="a\n"
+        )
+        assert result.exit_code == 1
+        assert "Aborted" in result.output
+        assert len(captured) == 1
+
+    def test_sync_secrets_detected_review_true_positive_flags_run(
+        self, tmp_path, monkeypatch
+    ):
+        """[r] + [t] → flags run locally, retries sync with exclude_runs."""
+        self._setup(tmp_path, monkeypatch)
+
+        from qualito.core.secret_scanner import Finding
+
+        finding = Finding(
+            pattern_name="aws_access_key",
+            field_path="runs.task",
+            match_preview="AKIAIO...",
+        )
+
+        _stub, captured = self._raise_secrets_then_succeed("alpha-0", finding)
+        monkeypatch.setattr(cloud_mod, "sync_runs", _stub, raising=True)
+        monkeypatch.setattr(
+            cloud_mod,
+            "sync_incidents",
+            lambda conn: {"synced": 0, "skipped": 0, "errors": 0},
+            raising=True,
+        )
+        monkeypatch.setattr(
+            cloud_mod,
+            "fetch_workspace_privacy",
+            lambda ws: {
+                "workspace_name": ws,
+                "sync_content": False,
+                "allow_llm": False,
+                "is_default": False,
+            },
+            raising=True,
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli, ["sync", "--workspace", "alpha"], input="r\nt\n"
+        )
+        assert result.exit_code == 0, result.output
+        assert len(captured) == 2
+        assert captured[1]["exclude_runs"] == {"alpha-0"}
+        assert "1 runs flagged as true positives" in result.output
+
+        # Verify the run was flagged in the local DB
+        db_path = tmp_path / ".qualito" / "qualito.db"
+        engine = get_engine(str(db_path))
+        verify_conn = get_sa_connection(engine)
+        try:
+            from sqlalchemy import select as sa_select
+
+            row = verify_conn.execute(
+                sa_select(runs_table.c.flagged, runs_table.c.flag_reason)
+                .where(runs_table.c.id == "alpha-0")
+            ).mappings().fetchone()
+            assert row is not None
+            assert row["flagged"] is True
+            assert row["flag_reason"].startswith("secret_detected:")
+            assert "aws_access_key" in row["flag_reason"]
+        finally:
+            verify_conn.close()

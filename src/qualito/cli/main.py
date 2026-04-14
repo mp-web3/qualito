@@ -1498,6 +1498,202 @@ def _render_workspace_limit_error(err) -> None:
     click.echo(f"  Upgrade: {err.upgrade_url}")
 
 
+def _ensure_workspace_privacy_choices(workspaces: list[str]) -> bool:
+    """Prompt the user to pick a privacy mode for any first-sync workspace.
+
+    For each workspace in ``workspaces``, fetch its server-side privacy row.
+    Rows flagged ``is_default=True`` are first-sync workspaces with no
+    explicit choice yet — the user must pick metadata-only or full content
+    before the sync can proceed. Non-default rows pass through silently.
+
+    Returns True on success (all workspaces handled), False if an error
+    made us bail out before any runs could be sent.
+    """
+    from qualito.cloud import (
+        CloudError,
+        fetch_workspace_privacy,
+        set_workspace_privacy,
+    )
+
+    for ws in workspaces:
+        try:
+            data = fetch_workspace_privacy(ws)
+        except CloudError as err:
+            click.echo(f"Cannot fetch privacy for '{ws}': {err}", err=True)
+            return False
+
+        if not data.get("is_default", False):
+            continue
+
+        click.echo("")
+        click.echo(f"Workspace '{ws}' — first sync. Choose privacy mode:")
+        click.echo("  [m] Metadata only (counts, durations, types — safe default)")
+        click.echo(
+            "  [f] Full content (prompts, tool outputs, file paths — richer dashboard)"
+        )
+
+        while True:
+            choice = str(click.prompt("Choice", default="m")).strip().lower()
+            if choice in ("", "m"):
+                try:
+                    set_workspace_privacy(ws, sync_content=False)
+                except CloudError as err:
+                    click.echo(f"Error setting privacy: {err}", err=True)
+                    return False
+                break
+            if choice == "f":
+                click.echo(
+                    "This will sync prompts, tool outputs, and file paths to"
+                )
+                click.echo(
+                    f"https://app.qualito.ai for workspace '{ws}'."
+                )
+                click.echo(
+                    "Use 'qualito audit secrets' to scan for accidental secrets before syncing."
+                )
+                if not click.confirm("Continue?", default=False):
+                    # User backed out — re-show [m/f] prompt
+                    continue
+                try:
+                    set_workspace_privacy(ws, sync_content=True)
+                except CloudError as err:
+                    click.echo(f"Error setting privacy: {err}", err=True)
+                    return False
+                click.echo(f"OK. {ws} now syncs full content.")
+                break
+            # Any other input → reprompt
+    return True
+
+
+def _flag_run_locally(conn, run_id: str, flag_reason: str) -> None:
+    """Mark a run as flagged with a reason via the existing update_run helper."""
+    from qualito.core.db import update_run
+
+    update_run(conn, run_id, flagged=True, flag_reason=flag_reason)
+
+
+def _render_secrets_findings(conn, findings_by_run: dict) -> None:
+    """Print the findings summary: per-run block with task + finding list."""
+    n = len(findings_by_run)
+    click.echo("")
+    click.echo(f"⚠  Found potential secrets in {n} run{'s' if n != 1 else ''}:")
+    click.echo("")
+
+    for run_id, findings in findings_by_run.items():
+        row = conn.execute(
+            select(runs_table.c.task, runs_table.c.started_at)
+            .where(runs_table.c.id == run_id)
+        ).mappings().fetchone()
+        task = ((row["task"] if row else "") or "").replace("\n", " ")[:60]
+        relative = _fmt_relative_time(row["started_at"] if row else None)
+        short_id = str(run_id)[:8]
+        click.echo(f"  Run {short_id} ({relative}, '{task}'):")
+        for f in findings:
+            click.echo(f"    - {f.pattern_name} in {f.field_path}")
+        click.echo("")
+
+
+def _handle_secret_findings(
+    conn, findings_by_run: dict
+) -> tuple[str, set]:
+    """Render findings and prompt [s/a/r]. Return (action, excluded_run_ids).
+
+    action is one of ``skip``, ``abort``, ``review``. ``excluded_run_ids``
+    is the set of run IDs to pass to the retry sync_runs call — for skip
+    it's all finding runs, for review it's every finding run (both true
+    positives and anything skipped/FP), for abort it's empty.
+    """
+    _render_secrets_findings(conn, findings_by_run)
+
+    n = len(findings_by_run)
+    click.echo("These runs will NOT be synced. Choose:")
+    click.echo(f"  [s] Skip these {n} runs, sync the rest (default)")
+    click.echo("  [a] Abort entire sync")
+    click.echo("  [r] Review each finding interactively")
+    choice = str(click.prompt("Choice", default="s")).strip().lower()
+
+    all_run_ids = set(findings_by_run.keys())
+    if choice == "a":
+        return "abort", set()
+    if choice == "r":
+        return _review_findings_interactive(conn, findings_by_run)
+    # "s", "", or anything else → skip
+    return "skip", all_run_ids
+
+
+def _review_findings_interactive(
+    conn, findings_by_run: dict
+) -> tuple[str, set]:
+    """Step through each finding, flag true positives, skip everything else.
+
+    [t] flags the run via update_run and moves on; [f] and [s] drop the run
+    from this sync without flagging; [q] bails out and treats all remaining
+    runs as skipped. Every run seen in the review is excluded from the
+    retry sync (flagged or not) because the CLI can't filter mid-run.
+    """
+    run_ids = list(findings_by_run.keys())
+    tp = 0
+    fp_skipped = 0
+    quit_early = False
+
+    for idx, run_id in enumerate(run_ids):
+        findings = findings_by_run[run_id]
+        if not findings:
+            fp_skipped += 1
+            continue
+
+        row = conn.execute(
+            select(runs_table.c.workspace, runs_table.c.task)
+            .where(runs_table.c.id == run_id)
+        ).mappings().fetchone()
+        ws = (row["workspace"] if row else "") or ""
+        task_full = ((row["task"] if row else "") or "").replace("\n", " ")
+
+        # Only the first finding per run drives the decision — [t]/[f]/[s]
+        # all jump to the next run, so additional findings in the same run
+        # would never be shown under any action path.
+        finding = findings[0]
+        short_id = str(run_id)[:8]
+        task_display = task_full[:80]
+
+        click.echo("")
+        click.echo(f"Run: {short_id}")
+        click.echo(f"Workspace: {ws}")
+        click.echo(f"Task: '{task_display}'")
+        click.echo(f"Pattern: {finding.pattern_name}")
+        click.echo(f"Field: {finding.field_path}")
+        click.echo(f"Preview: {finding.match_preview}")
+        click.echo("")
+        action = str(
+            click.prompt(
+                "Mark as [t]rue positive / [f]alse positive / [s]kip / [q]uit review",
+                default="s",
+            )
+        ).strip().lower()
+
+        if action == "t":
+            _flag_run_locally(
+                conn, run_id, f"secret_detected:{finding.pattern_name}"
+            )
+            tp += 1
+            continue
+        if action == "q":
+            quit_early = True
+            fp_skipped += len(run_ids) - idx
+            break
+        # "f", "s", empty, or anything else → treat as skipped
+        fp_skipped += 1
+
+    click.echo("")
+    click.echo(
+        f"{tp} runs flagged as true positives, "
+        f"{fp_skipped} as false positives/skipped."
+    )
+    if quit_early:
+        click.echo("(Review quit early — remaining runs counted as skipped.)")
+    return "review", set(run_ids)
+
+
 def _run_sync_with_progress(
     conn,
     selected_workspaces: list[str] | None,
@@ -1507,11 +1703,15 @@ def _run_sync_with_progress(
     """Execute a sync with per-workspace progress output.
 
     Shared by `qualito sync` and `qualito setup` so they render identical
-    progress. Handles CloudError and WorkspaceLimitError by printing the
-    parsed detail and exiting. Returns the run sync result dict on success.
+    progress. Before calling sync_runs, first-sync workspaces are prompted
+    for a privacy choice. SecretsDetectedError from the scan step is
+    surfaced as an interactive skip/abort/review prompt. Handles CloudError
+    and WorkspaceLimitError by printing the parsed detail and exiting.
+    Returns the run sync result dict on success.
     """
     from qualito.cloud import (
         CloudError,
+        SecretsDetectedError,
         WorkspaceLimitError,
         sync_incidents,
         sync_runs,
@@ -1538,6 +1738,12 @@ def _run_sync_with_progress(
         click.echo("Nothing to sync.")
         return {"synced": 0, "skipped": 0, "errors": 0, "by_workspace": {}}
 
+    # Prompt for any first-sync workspace privacy choices BEFORE hitting the
+    # sync endpoint — the server rejects runs for workspaces with no
+    # privacy row.
+    if not _ensure_workspace_privacy_choices(effective_workspaces):
+        raise SystemExit(1)
+
     click.echo("")
     click.echo("Syncing runs...")
     click.echo("")
@@ -1556,14 +1762,41 @@ def _run_sync_with_progress(
         click.echo(f"  ✓ {ws} synced")
         click.echo("")
 
-    try:
-        run_result = sync_runs(
+    def _do_sync(exclude_runs: set | None = None) -> dict:
+        return sync_runs(
             conn,
             since=since_date,
             workspaces=selected_workspaces,
             on_batch=on_batch,
             on_workspace_done=on_workspace_done,
+            exclude_runs=exclude_runs,
         )
+
+    excluded_after_secrets: set[str] = set()
+    try:
+        run_result = _do_sync()
+    except SecretsDetectedError as err:
+        action, excluded_after_secrets = _handle_secret_findings(
+            conn, err.findings_by_run
+        )
+        if action == "abort":
+            n = len(err.findings_by_run)
+            click.echo(f"Aborted. {n} runs not synced.")
+            raise SystemExit(1)
+        try:
+            run_result = _do_sync(exclude_runs=excluded_after_secrets)
+        except SecretsDetectedError as err2:
+            click.echo(
+                f"Secrets still detected after exclusion "
+                f"({len(err2.findings_by_run)} runs). Aborting."
+            )
+            raise SystemExit(1)
+        except WorkspaceLimitError as err2:
+            _render_workspace_limit_error(err2)
+            raise SystemExit(1)
+        except CloudError as err2:
+            click.echo(f"Sync failed: {err2}")
+            raise SystemExit(1)
     except WorkspaceLimitError as err:
         _render_workspace_limit_error(err)
         raise SystemExit(1)
@@ -1585,6 +1818,12 @@ def _run_sync_with_progress(
         f"Synced {synced_count} sessions across {synced_ws_count} workspaces."
     )
     click.echo("View at: https://app.qualito.ai/runs")
+    if excluded_after_secrets:
+        n = len(excluded_after_secrets)
+        click.echo(
+            f"{n} run{'s' if n != 1 else ''} were skipped due to detected secrets. "
+            "Review with: qualito audit secrets"
+        )
     return run_result
 
 

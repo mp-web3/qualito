@@ -255,19 +255,27 @@ def fetch_synced_workspaces() -> list[dict]:
 def fetch_workspace_privacy(workspace: str) -> dict:
     """Fetch per-workspace privacy setting.
 
-    Returns {workspace_name, sync_content, allow_llm}. Defaults to
-    {sync_content: False, allow_llm: False} if no row exists (404).
+    Returns {workspace_name, sync_content, allow_llm, is_default}. Defaults
+    to {sync_content: False, allow_llm: False, is_default: True} if no row
+    exists (404). ``is_default`` is True only when the server had no row —
+    the CLI uses it to detect first-sync workspaces and prompt for an
+    explicit privacy choice. Server responses with a real row always come
+    back with ``is_default: False``.
     """
     try:
-        return cloud_request("GET", f"/api/sync/workspaces/{workspace}/privacy")
+        result = cloud_request("GET", f"/api/sync/workspaces/{workspace}/privacy")
     except CloudError as e:
         if getattr(e, "status_code", None) == 404:
             return {
                 "workspace_name": workspace,
                 "sync_content": False,
                 "allow_llm": False,
+                "is_default": True,
             }
         raise
+    if isinstance(result, dict):
+        result.setdefault("is_default", False)
+    return result
 
 
 def set_workspace_privacy(
