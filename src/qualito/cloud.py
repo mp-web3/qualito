@@ -161,6 +161,63 @@ def cloud_request(method: str, path: str, data: dict | None = None, timeout: int
         raise CloudError(f"Cannot reach {api_url}: {e.reason}")
 
 
+_METADATA_ONLY_RUN_KEEP: frozenset[str] = frozenset({
+    "id", "workspace", "task_type", "model", "pipeline_mode", "status",
+    "cost_usd", "input_tokens", "output_tokens", "cache_read_tokens",
+    "duration_ms", "started_at", "completed_at", "source", "session_type",
+    "entrypoint", "claude_version", "session_name", "has_subagents",
+    "subagent_count", "error_count", "tool_count", "paper_live_gap",
+    "skill_name", "user_id",
+})
+
+_METADATA_ONLY_TOOL_CALL_KEEP: frozenset[str] = frozenset({
+    "tool_name", "is_error", "phase", "timestamp", "duration_ms",
+})
+
+_METADATA_ONLY_FILE_ACTIVITY_KEEP: frozenset[str] = frozenset({
+    "action", "timestamp",
+})
+
+_METADATA_ONLY_EVALUATION_KEEP: frozenset[str] = frozenset({
+    "eval_type", "score", "categories", "created_at",
+})
+
+
+def _strip_run_to_metadata(run: dict) -> dict:
+    """Return a metadata-only copy of a run dict.
+
+    Strips every text-bearing field. Keeps categorical, numeric, IDs, and
+    timestamps. Filters tool_calls / file_activity / evaluations child lists
+    to keep-only columns. Drops the artifacts list entirely (every artifact
+    field is sensitive).
+
+    Idempotent — stripping a stripped dict returns the same shape.
+    """
+    out = {k: v for k, v in run.items() if k in _METADATA_ONLY_RUN_KEEP}
+
+    tool_calls = run.get("tool_calls") or []
+    out["tool_calls"] = [
+        {k: v for k, v in tc.items() if k in _METADATA_ONLY_TOOL_CALL_KEEP}
+        for tc in tool_calls
+    ]
+
+    file_activity = run.get("file_activity") or []
+    out["file_activity"] = [
+        {k: v for k, v in fa.items() if k in _METADATA_ONLY_FILE_ACTIVITY_KEEP}
+        for fa in file_activity
+    ]
+
+    evaluations = run.get("evaluations") or []
+    out["evaluations"] = [
+        {k: v for k, v in ev.items() if k in _METADATA_ONLY_EVALUATION_KEEP}
+        for ev in evaluations
+    ]
+
+    out["artifacts"] = []
+
+    return out
+
+
 def _collect_run_data(conn, run_id: str) -> dict:
     """Collect a run with its evaluations, tool_calls, and file_activity."""
     return get_run(conn, run_id) or {}
