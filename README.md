@@ -52,10 +52,27 @@ qualito sync
 | `qualito status` | See your local and cloud sync state |
 | `qualito import` | Import Claude Code sessions for measurement (`--force` to re-process) |
 | `qualito costs` | Analyze spending by workspace, model, and time |
+| `qualito privacy` | View or change per-workspace sync privacy settings |
+| `qualito audit list` | List flagged runs needing review |
 | `qualito sync` | Push local sessions to the cloud dashboard |
 | `qualito login` | Authenticate with the Qualito cloud |
 | `qualito logout` | Remove cloud credentials |
-| `qualito dashboard` | Launch the local web dashboard |
+
+## View your data
+
+Qualito is CLI-first. Your data lives locally and is accessed through commands:
+
+```bash
+qualito status       # local + cloud breakdown with per-workspace tokens + cost
+qualito costs        # detailed spend analysis
+qualito privacy      # per-workspace sync privacy settings
+qualito audit list   # flagged runs needing review
+```
+
+For a web UI with charts and history, sync to the cloud and view at
+https://app.qualito.ai. Privacy is per-workspace and metadata-only by
+default — see docs/privacy.md for the full field-by-field breakdown
+(added by Phase 7 docs task).
 
 ## MCP Server
 
@@ -79,13 +96,10 @@ Tools available: `qualito_setup`, `dqi_cost`, `dqi_patterns`, `dqi_warnings`, `d
 ```bash
 git clone https://github.com/mp-web3/qualito.git
 cd qualito
-uv sync --extra dev --extra dashboard
+uv sync --extra dev --extra server
 
 # Run tests
 uv run pytest
-
-# Local dashboard
-uv run qualito dashboard
 ```
 
 ## License

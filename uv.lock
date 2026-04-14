@@ -1031,7 +1031,19 @@ all = [
     { name = "svix" },
     { name = "uvicorn" },
 ]
-dashboard = [
+dev = [
+    { name = "httpx" },
+    { name = "pytest" },
+    { name = "ruff" },
+]
+mcp = [
+    { name = "mcp" },
+    { name = "uvicorn" },
+]
+postgres = [
+    { name = "psycopg2-binary" },
+]
+server = [
     { name = "bcrypt" },
     { name = "charset-normalizer" },
     { name = "email-validator" },
@@ -1046,46 +1058,34 @@ dashboard = [
     { name = "svix" },
     { name = "uvicorn" },
 ]
-dev = [
-    { name = "httpx" },
-    { name = "pytest" },
-    { name = "ruff" },
-]
-mcp = [
-    { name = "mcp" },
-    { name = "uvicorn" },
-]
-postgres = [
-    { name = "psycopg2-binary" },
-]
 
 [package.metadata]
 requires-dist = [
-    { name = "bcrypt", marker = "extra == 'dashboard'", specifier = ">=4.0" },
-    { name = "charset-normalizer", marker = "extra == 'dashboard'", specifier = ">=3.0,<3.4.7" },
+    { name = "bcrypt", marker = "extra == 'server'", specifier = ">=4.0" },
+    { name = "charset-normalizer", marker = "extra == 'server'", specifier = ">=3.0,<3.4.7" },
     { name = "click", specifier = ">=8.1,<8.3.2" },
-    { name = "email-validator", marker = "extra == 'dashboard'", specifier = ">=2.0" },
-    { name = "fastapi", marker = "extra == 'dashboard'", specifier = ">=0.115,<0.135.3" },
+    { name = "email-validator", marker = "extra == 'server'", specifier = ">=2.0" },
+    { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.115,<0.135.3" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
-    { name = "jinja2", marker = "extra == 'dashboard'", specifier = ">=3.1" },
-    { name = "mcp", marker = "extra == 'dashboard'", specifier = ">=1.0,<1.27" },
+    { name = "jinja2", marker = "extra == 'server'", specifier = ">=3.1" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.0,<1.27" },
-    { name = "psycopg2-binary", marker = "extra == 'dashboard'", specifier = ">=2.9" },
+    { name = "mcp", marker = "extra == 'server'", specifier = ">=1.0,<1.27" },
     { name = "psycopg2-binary", marker = "extra == 'postgres'", specifier = ">=2.9" },
+    { name = "psycopg2-binary", marker = "extra == 'server'", specifier = ">=2.9" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
-    { name = "python-jose", extras = ["cryptography"], marker = "extra == 'dashboard'", specifier = ">=3.3" },
-    { name = "qualito", extras = ["dashboard"], marker = "extra == 'all'" },
+    { name = "python-jose", extras = ["cryptography"], marker = "extra == 'server'", specifier = ">=3.3" },
     { name = "qualito", extras = ["mcp"], marker = "extra == 'all'" },
-    { name = "resend", marker = "extra == 'dashboard'", specifier = ">=2.0" },
+    { name = "qualito", extras = ["server"], marker = "extra == 'all'" },
+    { name = "resend", marker = "extra == 'server'", specifier = ">=2.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4,<0.15.9" },
-    { name = "slowapi", marker = "extra == 'dashboard'", specifier = ">=0.1.9" },
+    { name = "slowapi", marker = "extra == 'server'", specifier = ">=0.1.9" },
     { name = "sqlalchemy", specifier = ">=2.0" },
-    { name = "stripe", marker = "extra == 'dashboard'", specifier = ">=7.0,<15.0.1" },
-    { name = "svix", marker = "extra == 'dashboard'", specifier = ">=1.0" },
-    { name = "uvicorn", marker = "extra == 'dashboard'", specifier = ">=0.31,<0.43" },
+    { name = "stripe", marker = "extra == 'server'", specifier = ">=7.0,<15.0.1" },
+    { name = "svix", marker = "extra == 'server'", specifier = ">=1.0" },
     { name = "uvicorn", marker = "extra == 'mcp'", specifier = ">=0.31,<0.43" },
+    { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.31,<0.43" },
 ]
-provides-extras = ["mcp", "postgres", "dashboard", "all", "dev"]
+provides-extras = ["mcp", "postgres", "server", "all", "dev"]
 
 [[package]]
 name = "referencing"

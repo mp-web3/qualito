@@ -2482,26 +2482,3 @@ def audit_drop(yes: bool):
         click.echo(f"Deleted {n} flagged run{'s' if n != 1 else ''}.")
     finally:
         conn.close()
-
-
-# ---------------------------------------------------------------------------
-# dqi dashboard
-# ---------------------------------------------------------------------------
-
-@cli.command(help="Launch the local web dashboard")
-@click.option("--port", default=8090, help="Port (default: 8090)")
-@click.option("--host", default="127.0.0.1", help="Host (default: 127.0.0.1)")
-def dashboard(port: int, host: str):
-    """Launch the Qualito dashboard web UI."""
-    try:
-        import uvicorn
-    except ImportError:
-        click.echo("Dashboard dependencies not installed. Run:")
-        click.echo("  uv pip install 'qualito[dashboard]'")
-        raise SystemExit(1)
-
-    from qualito.dashboard.app import create_app
-
-    app = create_app()
-    click.echo(f"Starting Qualito Dashboard at http://{host}:{port}")
-    uvicorn.run(app, host=host, port=port)
