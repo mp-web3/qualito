@@ -72,6 +72,8 @@ runs_table = Table(
     Column("subagent_count", Integer, server_default="0"),
     Column("error_count", Integer, server_default="0"),
     Column("tool_count", Integer, server_default="0"),
+    Column("flagged", Boolean, server_default=sa_false(), nullable=False),
+    Column("flag_reason", String, nullable=True),
 )
 
 tool_calls_table = Table(
@@ -353,6 +355,8 @@ synced_workspaces_table = Table(
     Column("first_synced_at", String, server_default=func.now()),
     Column("last_synced_at", String, server_default=func.now()),
     Column("session_count", Integer, server_default="0"),
+    Column("sync_content", Boolean, server_default=sa_false(), nullable=False),
+    Column("allow_llm", Boolean, server_default=sa_false(), nullable=False),
     UniqueConstraint("user_id", "workspace_name", name="uq_synced_workspaces_user_ws"),
 )
 
@@ -417,6 +421,10 @@ def init_db(engine=None):
         ("runs", "subagent_count", "ALTER TABLE runs ADD COLUMN subagent_count INTEGER DEFAULT 0"),
         ("runs", "error_count", "ALTER TABLE runs ADD COLUMN error_count INTEGER DEFAULT 0"),
         ("runs", "tool_count", "ALTER TABLE runs ADD COLUMN tool_count INTEGER DEFAULT 0"),
+        ("runs", "flagged", "ALTER TABLE runs ADD COLUMN flagged BOOLEAN DEFAULT FALSE NOT NULL"),
+        ("runs", "flag_reason", "ALTER TABLE runs ADD COLUMN flag_reason VARCHAR"),
+        ("synced_workspaces", "sync_content", "ALTER TABLE synced_workspaces ADD COLUMN sync_content BOOLEAN DEFAULT FALSE NOT NULL"),
+        ("synced_workspaces", "allow_llm", "ALTER TABLE synced_workspaces ADD COLUMN allow_llm BOOLEAN DEFAULT FALSE NOT NULL"),
     ]
     with engine.connect() as conn:
         db_url = str(engine.url)

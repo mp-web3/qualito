@@ -113,7 +113,17 @@ def test_runs_table_columns():
         "paper_live_gap", "skill_name", "source", "prompt_components",
         "user_id", "session_type", "entrypoint", "claude_version",
         "session_name", "has_subagents", "subagent_count", "error_count",
-        "tool_count",
+        "tool_count", "flagged", "flag_reason",
+    }
+    assert cols == expected
+
+
+def test_synced_workspaces_table_columns():
+    """Verify synced_workspaces table has all expected columns."""
+    cols = {c.name for c in metadata.tables["synced_workspaces"].columns}
+    expected = {
+        "id", "user_id", "workspace_name", "first_synced_at",
+        "last_synced_at", "session_count", "sync_content", "allow_llm",
     }
     assert cols == expected
 
