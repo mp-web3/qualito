@@ -1759,7 +1759,13 @@ def _run_sync_with_progress(
         )
 
     def on_workspace_done(ws, synced_count):
-        click.echo(f"  ✓ {ws} synced")
+        if synced_count == 0:
+            click.echo(
+                f"  ⚠  {ws} synced 0 runs (server rejected all — may be a "
+                f"privacy filter issue, check qualito status and Railway logs)"
+            )
+        else:
+            click.echo(f"  ✓ {ws} synced ({synced_count} runs)")
         click.echo("")
 
     def _do_sync(exclude_runs: set | None = None) -> dict:
