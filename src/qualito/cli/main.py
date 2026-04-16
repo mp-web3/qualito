@@ -1744,7 +1744,7 @@ def _run_sync_with_progress(
         raise SystemExit(1)
 
     click.echo("")
-    click.echo("Syncing runs...")
+    click.echo("Scanning for secrets and preparing sync...")
     click.echo("")
 
     current_ws = {"name": None}
@@ -1839,7 +1839,7 @@ def _run_sync_with_progress(
     "--workspace",
     "workspaces",
     multiple=True,
-    help="Workspace(s) to sync, repeatable (non-interactive)",
+    help="Workspace to sync (repeat for multiple: --workspace a --workspace b)",
 )
 def sync(since: str | None, sync_all: bool, workspaces: tuple[str, ...]):
     """Sync local data to the Qualito cloud.
