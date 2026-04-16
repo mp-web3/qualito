@@ -1,12 +1,10 @@
-"""Auto-evaluation engine for delegation runs.
+"""Auto-evaluation engine for Claude Code sessions.
 
-Runs 8 checks on every completed delegation and stores results in the evaluations table.
+Runs 8 checks on every completed session and stores results in the evaluations table.
 Also handles human scoring with per-task-type rubrics.
 """
 
 import json
-import subprocess
-from pathlib import Path
 
 from qualito.core.db import get_run, insert_evaluation
 
@@ -45,9 +43,14 @@ def _check_completed(run: dict) -> tuple[bool, str]:
     return run["status"] == "completed", run.get("status", "unknown")
 
 
-def _check_has_summary(run: dict) -> tuple[bool, str]:
-    summary = run.get("summary") or ""
-    return len(summary) > 0, f"{len(summary)} chars"
+def _check_error_rate(run: dict) -> tuple[bool, str]:
+    """Low error rate: fewer than 25% of tool calls errored."""
+    error_count = run.get("error_count") or 0
+    tool_count = run.get("tool_count") or 0
+    if tool_count == 0:
+        return True, "no tool calls"
+    rate = error_count / tool_count
+    return rate < 0.25, f"{rate:.0%} error rate ({error_count}/{tool_count})"
 
 
 def _check_tool_calls_made(run: dict) -> tuple[bool, str]:
@@ -55,29 +58,22 @@ def _check_tool_calls_made(run: dict) -> tuple[bool, str]:
     return count > 0, f"{count} tool calls"
 
 
-def _check_committed(run: dict) -> tuple[bool, str]:
-    """Check if code was committed on a branch."""
-    if run.get('pipeline_mode') == 'research-only':
-        return True, 'n/a (research-only)'
-    branch = run.get("branch")
-    if not branch:
-        return False, "no branch"
-    try:
-        result = subprocess.run(
-            ["git", "log", f"main..{branch}", "--oneline"],
-            capture_output=True, text=True, timeout=10,
-            cwd=run.get("cwd", Path.home()),
-        )
-        commits = result.stdout.strip().split("\n") if result.stdout.strip() else []
-        return len(commits) > 0, f"{len(commits)} commits"
-    except (subprocess.TimeoutExpired, OSError):
-        return False, "git check failed"
+def _check_tool_diversity(run: dict) -> tuple[bool, str]:
+    """Used 3+ distinct tool types (indicates productive session, not thrashing)."""
+    tool_calls = run.get("tool_calls", [])
+    distinct_tools = set(tc.get("tool_name", "") for tc in tool_calls if tc.get("tool_name"))
+    count = len(distinct_tools)
+    return count >= 3, f"{count} distinct tools"
 
 
-def _check_chains_recorded(run: dict) -> tuple[bool, str]:
-    """Check if si_reason was called (reasoning chain recorded)."""
-    si_calls = [tc for tc in run.get("tool_calls", []) if "si_reason" in tc.get("tool_name", "")]
-    return len(si_calls) > 0, f"{len(si_calls)} chains"
+def _check_cache_utilization(run: dict) -> tuple[bool, str]:
+    """Cache read tokens are at least 10% of input tokens (efficient context reuse)."""
+    cache = run.get("cache_read_tokens") or 0
+    input_tokens = run.get("input_tokens") or 0
+    if input_tokens == 0:
+        return True, "no input tokens"
+    rate = cache / input_tokens
+    return rate >= 0.10, f"{rate:.0%} cache hit rate"
 
 
 def _check_cost_reasonable(run: dict) -> tuple[bool, str]:
@@ -95,40 +91,26 @@ def _check_within_timeout(run: dict) -> tuple[bool, str]:
     return duration <= timeout_ms, f"{duration/1000:.0f}s (limit {timeout_ms/1000:.0f}s)"
 
 
-def _check_has_findings(run: dict) -> tuple[bool, str]:
-    """Task-type specific: PR reviews should have findings."""
-    if run.get("task_type") != "pr_review":
-        return True, "n/a"
-    summary = run.get("summary", "").lower()
-    has = any(w in summary for w in ["finding", "issue", "bug", "concern", "suggestion", "change"])
-    return has, "findings in summary" if has else "no findings detected"
-
-
-def _check_has_output(run: dict) -> tuple[bool, str]:
-    """Task-type specific: code tasks should produce files."""
-    if run.get('pipeline_mode') == 'research-only':
-        return True, 'n/a (research-only)'
-    if run.get("task_type") != "code":
-        return True, "n/a"
-    files = run.get("files_changed")
-    if isinstance(files, str):
-        try:
-            files = json.loads(files)
-        except json.JSONDecodeError:
-            files = []
-    count = len(files or [])
-    return count > 0, f"{count} files"
+def _check_completion_with_work(run: dict) -> tuple[bool, str]:
+    """Session completed AND did actual work (tool_count > 0)."""
+    completed = run.get("status") == "completed"
+    tool_count = run.get("tool_count") or 0
+    if not completed:
+        return False, f"status={run.get('status')}"
+    if tool_count == 0:
+        return False, "completed but 0 tool calls"
+    return True, f"completed with {tool_count} tool calls"
 
 
 ALL_CHECKS = [
     ("completed", _check_completed),
-    ("has_summary", _check_has_summary),
+    ("error_rate", _check_error_rate),
     ("tool_calls_made", _check_tool_calls_made),
-    ("chains_recorded", _check_chains_recorded),
+    ("tool_diversity", _check_tool_diversity),
     ("cost_reasonable", _check_cost_reasonable),
     ("within_timeout", _check_within_timeout),
-    ("has_findings", _check_has_findings),
-    ("has_output", _check_has_output),
+    ("cache_utilization", _check_cache_utilization),
+    ("completion_with_work", _check_completion_with_work),
 ]
 
 

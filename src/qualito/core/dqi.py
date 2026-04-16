@@ -1,4 +1,4 @@
-"""DQI (Delegation Quality Index) calculator.
+"""Session score calculator (formerly DQI).
 
 Composite quality score per run: completion (30%), quality (25%), efficiency (25%), cost (20%).
 Stored in evaluations table with eval_type='dqi'.
@@ -40,13 +40,13 @@ DURATION_THRESHOLDS = {
 # Quality check weights (must sum to ~1.0)
 QUALITY_WEIGHTS = {
     "completed": 0.05,
-    "has_summary": 0.20,
+    "error_rate": 0.20,
     "tool_calls_made": 0.15,
-    "chains_recorded": 0.10,
+    "tool_diversity": 0.15,
     "cost_reasonable": 0.05,
     "within_timeout": 0.05,
-    "has_findings": 0.20,
-    "has_output": 0.20,
+    "cache_utilization": 0.15,
+    "completion_with_work": 0.20,
 }
 
 
