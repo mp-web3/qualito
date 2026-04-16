@@ -11,7 +11,7 @@ import json
 from datetime import datetime, timedelta
 from statistics import mean, stdev
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, case, func, select
 
 from qualito.core.db import (
     evaluations_table,
@@ -44,7 +44,7 @@ def generate_recommendations(
             tool_calls_table.c.tool_name,
             func.count().label("total"),
             func.sum(
-                func.cast(tool_calls_table.c.is_error == True, runs_table.c.id.type)  # noqa: E712
+                case((tool_calls_table.c.is_error == True, 1), else_=0)  # noqa: E712
             ).label("errors"),
         )
         .select_from(
