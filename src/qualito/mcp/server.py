@@ -61,7 +61,7 @@ def _infer_task_type(description: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def dqi_score(workspace: str = "", days: int = 30) -> str:
+def qualito_score(workspace: str = "", days: int = 30) -> str:
     """Get DQI score summary: average, trend, component breakdown, tier distribution.
 
     Use this to understand overall delegation quality for a workspace over time.
@@ -140,7 +140,7 @@ def dqi_score(workspace: str = "", days: int = 30) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def dqi_cost(workspace: str = "", days: int = 30) -> str:
+def qualito_cost(workspace: str = "", days: int = 30) -> str:
     """Get cost analysis: total spend, average per run, daily trend, waste estimate.
 
     Runs with DQI < 0.5 are classified as waste. Use this to track delegation costs.
@@ -152,7 +152,7 @@ def dqi_cost(workspace: str = "", days: int = 30) -> str:
     conn = _get_conn()
     try:
         since = _since_date(days)
-        base_conds = [runs_table.c.started_at >= since, runs_table.c.source == "delegation"]
+        base_conds = [runs_table.c.started_at >= since]
         if workspace:
             base_conds.append(runs_table.c.workspace == workspace)
 
@@ -219,7 +219,7 @@ def dqi_cost(workspace: str = "", days: int = 30) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def dqi_patterns(min_count: int = 3) -> str:
+def qualito_patterns(min_count: int = 3) -> str:
     """Detect repeated task patterns with classification and recommendations.
 
     Groups runs by normalized task text and identifies patterns that should
@@ -242,7 +242,7 @@ def dqi_patterns(min_count: int = 3) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def dqi_warnings(workspace: str = "") -> str:
+def qualito_warnings(workspace: str = "") -> str:
     """Get warnings for underperforming workspace/task_type combinations.
 
     Shows combos with low average DQI, their most common failing check,
@@ -307,7 +307,7 @@ def dqi_warnings(workspace: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def dqi_templates(task_description: str) -> str:
+def qualito_templates(task_description: str) -> str:
     """Recommend a delegation template based on a task description.
 
     Infers the task type from keywords and suggests a matching template
@@ -440,7 +440,7 @@ def dqi_templates(task_description: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def dqi_incidents(workspace: str = "", status: str = "active") -> str:
+def qualito_incidents(workspace: str = "", status: str = "active") -> str:
     """Get DQI incidents — quality regressions and anomalies detected by monitoring.
 
     Returns incidents filtered by status. 'active' shows non-resolved incidents
@@ -504,7 +504,7 @@ def dqi_incidents(workspace: str = "", status: str = "active") -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def dqi_slo(workspace: str = "") -> str:
+def qualito_slo(workspace: str = "") -> str:
     """Check SLO compliance: quality, availability, and cost targets over last 30 days.
 
     Compares current performance against configured thresholds:
@@ -518,7 +518,7 @@ def dqi_slo(workspace: str = "") -> str:
     conn = _get_conn()
     try:
         since = _since_date(30)
-        base_conds = [runs_table.c.started_at >= since, runs_table.c.source == "delegation"]
+        base_conds = [runs_table.c.started_at >= since]
         if workspace:
             base_conds.append(runs_table.c.workspace == workspace)
 

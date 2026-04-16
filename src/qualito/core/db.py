@@ -62,7 +62,7 @@ runs_table = Table(
     Column("verifier_verdict", String),
     Column("paper_live_gap", Integer),
     Column("skill_name", String),
-    Column("source", String, server_default="delegation"),
+    Column("source", String, server_default="import"),
     Column("prompt_components", String),
     Column("user_id", Integer, ForeignKey("users.id"), index=True),
     Column("session_type", String, server_default="unknown"),

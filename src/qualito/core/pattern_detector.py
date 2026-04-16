@@ -119,7 +119,6 @@ def detect_patterns(
 
     conditions = [
         r.c.status == "completed",
-        r.c.source == "delegation",
         r.c.started_at >= since_date,
     ]
     if workspace:

@@ -33,7 +33,6 @@ def get_flagged_combos(conn, threshold: float, min_runs: int,
 
     conditions = [
         r.c.status == "completed",
-        r.c.source == "delegation",
         e.c.eval_type == "dqi",
     ]
     if workspace:
@@ -48,7 +47,7 @@ def get_flagged_combos(conn, threshold: float, min_runs: int,
             func.sum(case((e.c.score < 0.70, 1), else_=0)).label("low_count"),
         )
         .select_from(r.join(e, and_(e.c.run_id == r.c.id, e.c.eval_type == "dqi")))
-        .where(and_(r.c.status == "completed", r.c.source == "delegation",
+        .where(and_(r.c.status == "completed",
                      *([r.c.workspace == workspace] if workspace else [])))
         .group_by(r.c.workspace, r.c.task_type)
         .having(and_(func.count() >= min_runs, func.avg(e.c.score) < threshold))
@@ -70,8 +69,7 @@ def analyze_failure_patterns(conn, workspace: str, task_type: str) -> dict:
                 r.c.task_type == task_type,
                 e.c.eval_type == "auto",
                 r.c.status == "completed",
-                r.c.source == "delegation",
-            )
+                    )
         )
     ).mappings().fetchall()
 
@@ -123,8 +121,7 @@ def analyze_cost_gap(conn, workspace: str, task_type: str) -> dict:
                 r.c.workspace == workspace,
                 r.c.task_type == task_type,
                 r.c.status == "completed",
-                r.c.source == "delegation",
-            )
+                    )
         )
     ).mappings().fetchone()
 
