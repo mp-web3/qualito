@@ -1,6 +1,11 @@
 """Qualito — Quality metrics for AI-assisted development.
 
-Measure and improve your Claude Code delegation quality.
+See what your Claude Code sessions cost, detect quality issues,
+and run experiments to improve.
 """
 
-__version__ = "0.1.10"
+try:
+    from importlib.metadata import version as _get_version
+    __version__ = _get_version("qualito")
+except Exception:
+    __version__ = "0.0.0"
