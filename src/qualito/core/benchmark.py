@@ -1,4 +1,4 @@
-"""Benchmark suite & experiment tracker for delegation quality.
+"""Benchmark suite & experiment tracker for session quality.
 
 Provides suite definition, experiment execution, and statistical comparison
 (Wilcoxon signed-rank + Bayesian) between experiments.

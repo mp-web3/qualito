@@ -182,6 +182,8 @@ experiments_table = Table(
     Column("avg_dqi", Float),
     Column("per_task_dqi", String),
     Column("config_snapshot", String),
+    Column("hypothesis", String),
+    Column("conclusion", String),
     Column("created_at", String, server_default=func.now()),
     Column("completed_at", String),
 )
