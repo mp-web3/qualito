@@ -1,6 +1,6 @@
-"""Incident detection engine for delegation quality.
+"""Incident detection engine for session quality.
 
-Detects quality incidents from delegation run data:
+Detects quality incidents from synced run data:
 - Consecutive failures (critical)
 - DQI burn rate (warning)
 - Cost anomalies (warning)
@@ -52,6 +52,7 @@ _baseline_run_counts: dict[str, int] = {}
 def compute_workspace_baselines(
     conn,
     workspace: str,
+    user_id: int | None = None,
     *,
     slo_quality: float = DEFAULT_SLO_QUALITY,
     slo_cost: float = DEFAULT_SLO_COST,
@@ -63,10 +64,13 @@ def compute_workspace_baselines(
     completion_rate, error_rate. Cached until baseline_window+ new runs.
     """
     # Check cache freshness
+    count_conds = [runs_table.c.workspace == workspace]
+    if user_id is not None:
+        count_conds.append(runs_table.c.user_id == user_id)
     total_runs = conn.execute(
         select(func.count().label("cnt"))
         .select_from(runs_table)
-        .where(runs_table.c.workspace == workspace)
+        .where(and_(*count_conds))
     ).mappings().fetchone()["cnt"]
 
     if workspace in _baseline_cache:
@@ -91,7 +95,7 @@ def compute_workspace_baselines(
                 ),
             )
         )
-        .where(runs_table.c.workspace == workspace)
+        .where(and_(*count_conds))
         .order_by(runs_table.c.started_at.desc())
         .limit(baseline_window)
     ).mappings().fetchall()
@@ -465,13 +469,16 @@ def check_error_pattern_spike(
     }
 
 
-def check_run(conn, run_id: str) -> list[dict]:
+def check_run(conn, run_id: str, user_id: int | None = None) -> list[dict]:
     """Main entry point: run all checks for a given run.
 
     Returns list of new/updated incidents.
     """
+    conds = [runs_table.c.id == run_id]
+    if user_id is not None:
+        conds.append(runs_table.c.user_id == user_id)
     row = conn.execute(
-        select(runs_table.c.workspace).where(runs_table.c.id == run_id)
+        select(runs_table.c.workspace).where(and_(*conds))
     ).mappings().fetchone()
     if not row:
         return []
@@ -720,3 +727,35 @@ def check_auto_resolve(
         })
 
     return resolved
+
+
+def detect_for_workspaces(
+    conn, workspaces: list[str], user_id: int | None = None
+) -> list[dict]:
+    """Run all detection checks for a list of workspaces.
+
+    Called server-side after sync completes. Also runs auto-resolve.
+    Returns combined list of new/updated/resolved incidents.
+    """
+    results = []
+
+    for ws in workspaces:
+        # Get latest run for this workspace
+        conds = [runs_table.c.workspace == ws]
+        if user_id is not None:
+            conds.append(runs_table.c.user_id == user_id)
+        latest = conn.execute(
+            select(runs_table.c.id)
+            .where(and_(*conds))
+            .order_by(runs_table.c.started_at.desc())
+            .limit(1)
+        ).fetchone()
+
+        if latest:
+            results.extend(check_run(conn, latest[0], user_id=user_id))
+
+    # Also run auto-resolve
+    results.extend(check_auto_resolve(conn))
+    results.extend(check_monitoring_close(conn))
+
+    return results
