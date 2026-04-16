@@ -103,7 +103,7 @@ class TestPrivacyList:
         assert "full content" in result.output  # assistant has sync_content=True
         assert "metadata only" in result.output
         # Footer
-        assert "Default: metadata only" in result.output
+        assert "Default: full content" in result.output
 
 
 # ---------------------------------------------------------------------------

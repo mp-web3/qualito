@@ -27,6 +27,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy import false as sa_false
+from sqlalchemy import true as sa_true
 
 # ---------------------------------------------------------------------------
 # SQLAlchemy Core table definitions
@@ -355,7 +356,7 @@ synced_workspaces_table = Table(
     Column("first_synced_at", String, server_default=func.now()),
     Column("last_synced_at", String, server_default=func.now()),
     Column("session_count", Integer, server_default="0"),
-    Column("sync_content", Boolean, server_default=sa_false(), nullable=False),
+    Column("sync_content", Boolean, server_default=sa_true(), nullable=False),
     Column("allow_llm", Boolean, server_default=sa_false(), nullable=False),
     UniqueConstraint("user_id", "workspace_name", name="uq_synced_workspaces_user_ws"),
 )

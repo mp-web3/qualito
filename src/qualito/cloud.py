@@ -256,7 +256,7 @@ def fetch_workspace_privacy(workspace: str) -> dict:
     """Fetch per-workspace privacy setting.
 
     Returns {workspace_name, sync_content, allow_llm, is_default}. Defaults
-    to {sync_content: False, allow_llm: False, is_default: True} if no row
+    to {sync_content: True, allow_llm: False, is_default: True} if no row
     exists (404). ``is_default`` is True only when the server had no row —
     the CLI uses it to detect first-sync workspaces and prompt for an
     explicit privacy choice. Server responses with a real row always come
@@ -268,7 +268,7 @@ def fetch_workspace_privacy(workspace: str) -> dict:
         if getattr(e, "status_code", None) == 404:
             return {
                 "workspace_name": workspace,
-                "sync_content": False,
+                "sync_content": True,
                 "allow_llm": False,
                 "is_default": True,
             }

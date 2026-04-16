@@ -1527,39 +1527,38 @@ def _ensure_workspace_privacy_choices(workspaces: list[str]) -> bool:
 
         click.echo("")
         click.echo(f"Workspace '{ws}' — first sync. Choose privacy mode:")
-        click.echo("  [m] Metadata only (counts, durations, types — safe default)")
         click.echo(
-            "  [f] Full content (prompts, tool outputs, file paths — richer dashboard)"
+            "  [f] Full content (prompts, tool outputs, file paths — default)"
+        )
+        click.echo(
+            "  [m] Metadata only (counts, durations, types — privacy-conscious)"
         )
 
         while True:
-            choice = str(click.prompt("Choice", default="m")).strip().lower()
-            if choice in ("", "m"):
-                try:
-                    set_workspace_privacy(ws, sync_content=False)
-                except CloudError as err:
-                    click.echo(f"Error setting privacy: {err}", err=True)
-                    return False
-                break
-            if choice == "f":
+            choice = str(click.prompt("Choice", default="f")).strip().lower()
+            if choice in ("", "f"):
                 click.echo(
-                    "This will sync prompts, tool outputs, and file paths to"
+                    "Full content selected. Secrets are always blocked before sync."
                 )
-                click.echo(
-                    f"https://app.qualito.ai for workspace '{ws}'."
-                )
-                click.echo(
-                    "Use 'qualito audit secrets' to scan for accidental secrets before syncing."
-                )
-                if not click.confirm("Continue?", default=False):
-                    # User backed out — re-show [m/f] prompt
-                    continue
                 try:
                     set_workspace_privacy(ws, sync_content=True)
                 except CloudError as err:
                     click.echo(f"Error setting privacy: {err}", err=True)
                     return False
-                click.echo(f"OK. {ws} now syncs full content.")
+                break
+            if choice == "m":
+                click.echo(
+                    "Metadata only — session counts, costs, and tool usage will sync."
+                )
+                click.echo(
+                    "Prompts, tool outputs, and file paths will NOT be sent."
+                )
+                try:
+                    set_workspace_privacy(ws, sync_content=False)
+                except CloudError as err:
+                    click.echo(f"Error setting privacy: {err}", err=True)
+                    return False
+                click.echo(f"OK. {ws} syncs metadata only.")
                 break
             # Any other input → reprompt
     return True
@@ -2210,8 +2209,8 @@ def privacy(
 
     click.echo()
     click.echo(
-        "Default: metadata only. Use 'qualito privacy <workspace> --full' "
-        "to share content."
+        "Default: full content. Use 'qualito privacy <workspace> --metadata' "
+        "to restrict to metadata only."
     )
 
 

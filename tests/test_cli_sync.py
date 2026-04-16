@@ -652,11 +652,10 @@ class TestSyncPrivacyAndSecrets:
 
         runner = CliRunner()
         result = runner.invoke(
-            cli, ["sync", "--workspace", "alpha"], input="f\ny\n"
+            cli, ["sync", "--workspace", "alpha"], input="f\n"
         )
         assert result.exit_code == 0, result.output
-        assert "sync prompts, tool outputs" in result.output
-        assert "qualito audit secrets" in result.output
+        assert "Full content selected" in result.output
 
         set_events = [e for e in events if e[0] == "set_privacy"]
         assert set_events == [("set_privacy", "alpha", True)]
