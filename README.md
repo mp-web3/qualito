@@ -8,41 +8,31 @@ Quality metrics for AI-assisted development. Know if your Claude Code sessions a
 
 ## What it does
 
-Qualito analyzes your Claude Code sessions and gives you a **DQI score** (Delegation Quality Index) — a composite metric that measures how effectively you're using AI assistance. It tracks cost, duration, success rate, and quality across every session.
+Qualito scores every Claude Code session on multiple quality dimensions (error rate, tool diversity, cache utilization, completion with work) and rolls them into a single **Score** (0-100). It tracks cost, detects incidents (error spikes, cost anomalies, quality drops), and surfaces actionable recommendations.
 
-- Import existing Claude Code sessions — no behavior change needed
-- Score each session with a DQI composite (0-100)
+- Read existing Claude Code sessions — no behavior change needed
+- Score each session across multiple dimensions (0-100)
 - Track costs, detect incidents, monitor quality trends
 - Set SLOs and get alerts when quality drops
-- Run experiments to compare different approaches
+- Compare runs before/after a change (observational experiments)
 
 ## Quick Start
 
-```bash
-# Install and set up (imports your existing Claude Code sessions)
-uvx qualito setup
+**See [docs/getting-started.md](docs/getting-started.md)** for the full walkthrough.
 
-# Or install permanently
-uv tool install qualito
-qualito setup
-```
+Short version:
 
-Every Claude Code user already has session data at `~/.claude/projects/`. Qualito reads it — you'll see your first scores in under 2 minutes.
+1. Sign up at **https://app.qualito.ai/login**
+2. Copy the setup command shown on the onboarding page (includes a one-time token)
+3. Paste into your terminal:
+   ```bash
+   uvx qualito@latest setup st_setup_<your_token>
+   ```
+4. Refresh the dashboard → your sessions are live
 
 ## Cloud Dashboard
 
-```bash
-# Authenticate with qualito.ai
-qualito login
-
-# Push data to cloud
-qualito sync
-
-# Open dashboard
-# → https://app.qualito.ai
-```
-
-**Free tier:** 3 workspaces. **Pro ($29/mo):** unlimited workspaces + quality scoring.
+**Free tier:** 3 workspaces synced. **Pro ($29/mo, coming soon):** unlimited workspaces + LLM-generated root-cause + report summaries.
 
 ## CLI Commands
 
@@ -99,7 +89,7 @@ Use Qualito inline in your editor via MCP:
 }
 ```
 
-Tools available: `qualito_setup`, `dqi_cost`, `dqi_patterns`, `dqi_warnings`, `dqi_templates`.
+Tools available: `qualito_setup`, `qualito_score`, `qualito_cost`, `qualito_patterns`, `qualito_warnings`, `qualito_templates`, `qualito_incidents`, `qualito_slo`.
 
 ## Local Development
 
