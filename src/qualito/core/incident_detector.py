@@ -27,6 +27,7 @@ from qualito.core.db import (
     tool_calls_table,
     update_incident,
 )
+from qualito.core.state_machines import INCIDENT_MACHINE, validate_transition
 
 # --- Default SLO constants ---
 
@@ -623,6 +624,7 @@ def check_monitoring_close(
             continue
 
         # Resolve the incident
+        assert validate_transition(INCIDENT_MACHINE, "monitoring", "resolved")
         update_incident(
             conn,
             incident_id,
@@ -705,6 +707,7 @@ def check_auto_resolve(
             continue
 
         # Auto-resolve
+        assert validate_transition(INCIDENT_MACHINE, "detected", "auto_resolved")
         update_incident(
             conn,
             inc["id"],

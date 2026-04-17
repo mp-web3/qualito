@@ -137,8 +137,8 @@ def test_incidents_table_columns():
         "trigger_metric", "trigger_value", "baseline_value", "burn_rate",
         "affected_run_ids", "total_affected_runs", "cost_impact_usd",
         "fix_experiment_id", "fix_description", "resolution_type",
-        "created_at", "confirmed_at", "resolved_at", "time_to_detect_runs",
-        "time_to_resolve_runs",
+        "created_at", "confirmed_at", "fix_deployed_at", "resolved_at",
+        "time_to_detect_runs", "time_to_resolve_runs", "user_id",
     }
     assert cols == expected
 

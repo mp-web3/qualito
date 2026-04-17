@@ -238,9 +238,11 @@ incidents_table = Table(
     Column("resolution_type", String),
     Column("created_at", String, server_default=func.now()),
     Column("confirmed_at", String),
+    Column("fix_deployed_at", String),
     Column("resolved_at", String),
     Column("time_to_detect_runs", Integer),
     Column("time_to_resolve_runs", Integer),
+    Column("user_id", Integer, ForeignKey("users.id"), index=True),
 )
 
 incident_events_table = Table(
@@ -428,6 +430,8 @@ def init_db(engine=None):
         ("runs", "flag_reason", "ALTER TABLE runs ADD COLUMN flag_reason VARCHAR"),
         ("synced_workspaces", "sync_content", "ALTER TABLE synced_workspaces ADD COLUMN sync_content BOOLEAN DEFAULT FALSE NOT NULL"),
         ("synced_workspaces", "allow_llm", "ALTER TABLE synced_workspaces ADD COLUMN allow_llm BOOLEAN DEFAULT FALSE NOT NULL"),
+        ("incidents", "fix_deployed_at", "ALTER TABLE incidents ADD COLUMN fix_deployed_at VARCHAR"),
+        ("incidents", "user_id", "ALTER TABLE incidents ADD COLUMN user_id INTEGER REFERENCES users(id)"),
     ]
     with engine.connect() as conn:
         db_url = str(engine.url)
@@ -445,6 +449,33 @@ def init_db(engine=None):
             except Exception:
                 pass  # Column already exists (SQLite fallback)
         conn.commit()
+
+        # Backfill incidents.user_id from the first affected run's user_id.
+        # Runs once per incident with NULL user_id; no-op once backfilled.
+        try:
+            rows = conn.execute(text(
+                "SELECT id, affected_run_ids FROM incidents "
+                "WHERE user_id IS NULL AND affected_run_ids IS NOT NULL"
+            )).fetchall()
+            for inc_id, raw in rows:
+                try:
+                    ids = json.loads(raw) if isinstance(raw, str) else raw
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(ids, list) or not ids:
+                    continue
+                first_run = conn.execute(
+                    text("SELECT user_id FROM runs WHERE id = :rid"),
+                    {"rid": str(ids[0])},
+                ).fetchone()
+                if first_run and first_run[0] is not None:
+                    conn.execute(
+                        text("UPDATE incidents SET user_id = :uid WHERE id = :iid"),
+                        {"uid": first_run[0], "iid": inc_id},
+                    )
+            conn.commit()
+        except Exception:
+            pass  # Backfill is best-effort
 
     return engine
 
@@ -784,14 +815,9 @@ def insert_incident_event(conn, incident_id: int,
     conn.commit()
 
 
-def get_incident(conn, incident_id: int) -> dict | None:
-    """Get a single incident with all events attached."""
-    row = conn.execute(
-        select(incidents_table).where(incidents_table.c.id == incident_id)
-    ).mappings().fetchone()
-    if not row:
-        return None
-    incident = dict(row)
+def _hydrate_incident(conn, incident: dict) -> dict:
+    """Attach events + affected_runs to a raw incident row dict."""
+    incident_id = incident["id"]
 
     events = conn.execute(
         select(incident_events_table)
@@ -800,7 +826,64 @@ def get_incident(conn, incident_id: int) -> dict | None:
     ).mappings().fetchall()
     incident["events"] = [dict(r) for r in events]
 
+    run_ids: list[str] = []
+    raw = incident.get("affected_run_ids")
+    if raw:
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, list):
+                run_ids = [str(r) for r in parsed]
+        except (json.JSONDecodeError, TypeError):
+            run_ids = []
+
+    affected_runs: list[dict] = []
+    if run_ids:
+        run_rows = conn.execute(
+            select(
+                runs_table.c.id,
+                runs_table.c.workspace,
+                runs_table.c.task,
+                runs_table.c.task_type,
+                runs_table.c.status,
+                runs_table.c.cost_usd,
+                runs_table.c.duration_ms,
+                runs_table.c.summary,
+            ).where(runs_table.c.id.in_(run_ids))
+        ).mappings().fetchall()
+        by_id = {r["id"]: dict(r) for r in run_rows}
+        affected_runs = [by_id[rid] for rid in run_ids if rid in by_id]
+    incident["affected_runs"] = affected_runs
+
     return incident
+
+
+def get_incident_for_user(conn, incident_id: int, user_id: int) -> dict | None:
+    """Get an incident only if it belongs to the given user.
+
+    Returns None if the incident doesn't exist OR belongs to another user.
+    Callers should return 404 in both cases to avoid an existence oracle.
+    """
+    row = conn.execute(
+        select(incidents_table).where(
+            and_(
+                incidents_table.c.id == incident_id,
+                incidents_table.c.user_id == user_id,
+            )
+        )
+    ).mappings().fetchone()
+    if not row:
+        return None
+    return _hydrate_incident(conn, dict(row))
+
+
+def get_incident(conn, incident_id: int) -> dict | None:
+    """Get a single incident with events and hydrated affected runs attached."""
+    row = conn.execute(
+        select(incidents_table).where(incidents_table.c.id == incident_id)
+    ).mappings().fetchone()
+    if not row:
+        return None
+    return _hydrate_incident(conn, dict(row))
 
 
 def get_incidents(conn, workspace: str | None = None,
