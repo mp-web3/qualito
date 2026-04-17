@@ -4,12 +4,16 @@ import json
 import os
 import sys
 from datetime import datetime, timedelta
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
 import click
 from sqlalchemy import and_, case, func, select
 
-from qualito import __version__
+try:
+    __version__ = _pkg_version("qualito")
+except Exception:
+    __version__ = "0.0.0"
 
 from qualito.core.db import (
     get_engine,
