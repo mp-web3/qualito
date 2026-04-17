@@ -1,6 +1,6 @@
 [project]
 name = "qualito"
-version = "0.1.12"
+version = "0.1.13"
 description = "Quality metrics for Claude Code sessions — score, track, and improve."
 readme = "README.md"
 license = "MIT"

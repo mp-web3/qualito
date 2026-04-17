@@ -651,7 +651,7 @@ def get_conversation(conn, run_id: str) -> dict | None:
 
 
 def get_run(conn, run_id: str) -> dict | None:
-    """Get a single run with all related data."""
+    """Get a single run with all related data (incl. conversation messages)."""
     row = conn.execute(
         select(runs_table).where(runs_table.c.id == run_id)
     ).mappings().fetchone()
@@ -679,6 +679,9 @@ def get_run(conn, run_id: str) -> dict | None:
         .order_by(evaluations_table.c.id)
     ).mappings().fetchall()
     run["evaluations"] = [dict(r) for r in evals]
+
+    conv = get_conversation(conn, run_id)
+    run["conversation"] = conv["messages"] if conv else []
 
     return run
 
