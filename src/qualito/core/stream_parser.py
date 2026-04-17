@@ -42,6 +42,9 @@ class ParsedStream:
     cache_read_tokens: int = 0
 
 
+_ERROR_MAX_LEN = 10_000  # preserve stack traces, multi-line tool_use_error, long bash output
+
+
 def _summarize(obj: any, max_len: int = 200) -> str:
     """Summarize an object to max_len chars."""
     if obj is None:
@@ -141,8 +144,11 @@ def parse_stream(stream_path: Path, phase: str = "single") -> ParsedStream:
             if tool_use_id and tool_use_id in pending_tools:
                 tc = pending_tools[tool_use_id]
                 content = event.get("content", "")
-                tc.result_summary = _summarize(content)
-                tc.is_error = bool(event.get("is_error", False))
+                is_error = bool(event.get("is_error", False))
+                tc.result_summary = _summarize(
+                    content, max_len=_ERROR_MAX_LEN if is_error else 200
+                )
+                tc.is_error = is_error
                 if tc.tool_name in _PRESERVE_FULL_ARGS:
                     tc.full_result = content if isinstance(content, str) else str(content)
 
@@ -157,8 +163,11 @@ def parse_stream(stream_path: Path, phase: str = "single") -> ParsedStream:
                 if tool_use_id and tool_use_id in pending_tools:
                     tc = pending_tools[tool_use_id]
                     content = block.get("content", "")
-                    tc.result_summary = _summarize(content)
-                    tc.is_error = bool(block.get("is_error", False))
+                    is_error = bool(block.get("is_error", False))
+                    tc.result_summary = _summarize(
+                        content, max_len=_ERROR_MAX_LEN if is_error else 200
+                    )
+                    tc.is_error = is_error
                     if tc.tool_name in _PRESERVE_FULL_ARGS:
                         tc.full_result = content if isinstance(content, str) else str(content)
 
